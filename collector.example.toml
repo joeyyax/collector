@@ -6,6 +6,8 @@ host = ""
 # Loopback by default. The container image sets 0.0.0.0; publish the port on 127.0.0.1 or a private address.
 listen = "127.0.0.1:9273"
 interval = "15s"
+# Collection interval while a client follows /api/v1/stream.
+live_interval = "5s"
 log_level = "info"
 # How long SIGTERM waits for the last log batch and queued remote-write pushes.
 shutdown_timeout = "10s"
@@ -15,6 +17,10 @@ shutdown_timeout = "10s"
 token = ""
 token_file = ""
 workers = 4
+
+[metrics]
+# Names for remote write: "none" for clean names, "cadvisor" for cAdvisor's. Scrapes choose with ?compat=.
+compat = "none"
 
 [paths]
 # Values for the container image; built-in defaults are /proc, /sys and /.
@@ -42,6 +48,10 @@ labels = ["com.docker.compose.project", "com.docker.compose.service"]
 # Labels copied onto logs and the API only, never metrics. Same matching as labels.
 api_labels = []
 resync = "5m"
+# Measure each container's writable layer, one at a time. Needs CAP_DAC_READ_SEARCH to see private directories.
+writable_layer = false
+# Time for one pass over every container.
+writable_layer_interval = "1h"
 
 [gpu]
 # auto: use nvidia-smi when it runs, otherwise stay off.
@@ -69,6 +79,8 @@ parse_level = true
 promote_fields = []
 # Lines buffered from Docker logs API followers (local and journald drivers).
 api_queue_lines = 4096
+# Docker label with a numeric VictoriaLogs AccountID per container; empty sends everything to tenant 0.
+tenant_label = ""
 
 [logs.multiline]
 # off | indent (leading space or tab continues) | continue (pattern continues) | start (pattern starts a record)

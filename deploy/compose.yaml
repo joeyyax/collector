@@ -27,6 +27,8 @@ services:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - collector-state:/var/lib/collector
     secrets: [collector-token]
+    # With COLLECTOR_CONTAINERS__WRITABLE_LAYER: "true", lets the size walk into directories containers keep private.
+    # cap_add: [DAC_READ_SEARCH]
     # GPU hosts: uncomment so nvidia-smi is injected. pid: host lets it see container processes for per-container GPU memory.
     # runtime: nvidia
     # pid: host

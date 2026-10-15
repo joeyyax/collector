@@ -4,7 +4,9 @@ Watch a Docker host's CPU, memory, disks, network, GPUs, containers and logs wit
 
 A typical Docker host runs node_exporter for host metrics, cAdvisor for container metrics, a GPU exporter and a log shipper such as Alloy or Promtail. Each is a separate process with its own polling, and cAdvisor alone can use a full CPU core on a busy host. The collector reads the same numbers straight from `/proc`, `/sys` and cgroup v2 files on a timer, asks Docker only for the container list and its events, and keeps `nvidia-smi` running for GPU readings. It serves everything as Prometheus metrics, the text format most monitoring tools scrape, and ships container logs to VictoriaLogs, a log database, or to a local file.
 
-Metric names match node_exporter, cAdvisor and the NVIDIA GPU exporter, so existing dashboards and alerts keep working. [docs/metrics.md](docs/metrics.md) lists what matches and what's missing.
+Host and GPU metric names match node_exporter and the NVIDIA GPU exporter. Container metrics use cAdvisor's names with clean labels (`container`, `container_id`, `compose_project`, `compose_service`); scrape `/metrics?compat=cadvisor` to get cAdvisor's exact names and labels for existing dashboards and alerts. It also reports what cAdvisor can't: restarts, exit codes, OOM kills of the main process, health checks and per-container GPU memory. [docs/metrics.md](docs/metrics.md) lists what matches, what differs and what's missing.
+
+It keeps no history: each response is the latest collection, and log cursors are the only state on disk.
 
 ## Run it
 
@@ -55,6 +57,10 @@ GPU hosts need the NVIDIA runtime so `nvidia-smi` is injected: `runtime: nvidia`
 
 Per-container GPU memory also needs `pid: host`. `nvidia-smi` lists only the processes in its own PID namespace, so without it every container reports no GPU use and the collector logs why at startup. It also lets the collector see, and as root signal, every process on the host, so turn it on only where per-container GPU numbers are worth that.
 
+Writable-layer sizes (`containers.writable_layer`, off by default) need `cap_add: [DAC_READ_SEARCH]` to see inside directories containers keep private; see [docs/api.md](docs/api.md#writable-layer).
+
+The image's `HEALTHCHECK` runs `collector health`.
+
 Without Docker: `collector --config collector.toml` with the default paths (`/proc`, `/sys`, `/`).
 
 ## Configure
@@ -86,13 +92,31 @@ The binary listens on `127.0.0.1:9273` by default (`listen`). The image sets `0.
 
 | Endpoint | Auth | Returns |
 |---|---|---|
-| `GET /metrics` | token | Prometheus text format, gzip when the client accepts it |
+| `GET /metrics` | token | Prometheus text format, gzip when the client accepts it. `?compat=cadvisor` for cAdvisor's names |
 | `GET /health` | none | `{"status":"ok","version":...}`; 503 when the last collection is older than three intervals plus 5 s |
+| `GET /api/v1/snapshot` | token | Host, GPUs, running and recently stopped containers from one collection |
+| `GET /api/v1/stream` | token | The snapshot as server-sent events; collection runs every `live_interval` (5 s) while anyone follows |
 | `GET /api/v1/host` | token | Host snapshot with derived rates |
 | `GET /api/v1/containers` | token | Every running container with its latest readings |
-| `GET /api/v1/containers/:id` | token | One container by full ID, name, or ID prefix of four or more characters |
+| `GET /api/v1/containers/:id` | token | One container by full ID, name, or unique ID prefix of four or more characters |
+| `GET /api/v1/gpus` | token | GPUs with the containers holding memory on each |
 
-With `api.token` or `api.token_file` set, requests need `Authorization: Bearer <token>`; without one the API is open. Requests are served by `api.workers` threads (4), so a slow client can't hold up a scrape. Shapes and examples: [docs/api.md](docs/api.md).
+Container lists, the snapshot and the stream take `sort` (`cpu`, `memory`, `net_rx`, `net_tx`, `disk_read`, `disk_write`, `name`) and `limit`, so `/api/v1/containers?sort=cpu&limit=10` is the ten busiest.
+
+With `api.token` or `api.token_file` set, requests need `Authorization: Bearer <token>`; without one the API is open. Requests are served by `api.workers` threads (4), so a slow client can't hold up a scrape; each stream gets its own thread, up to 16. Shapes and examples: [docs/api.md](docs/api.md).
+
+## Command line
+
+`collector health`, `host`, `containers` and `gpus` call the matching route and print a table, or the raw response with `--json`:
+
+```sh
+$ collector containers --sort cpu --limit 3
+NAME        STATE    HEALTH   CPU   MEMORY     LIMIT      NET RX      NET TX     READ   WRITE       RESTARTS
+shop-web    running  healthy  1.42  611.3 MiB  1.0 GiB    1.2 MiB/s   3.4 MiB/s  0 B/s  12.0 KiB/s  0
+shop-redis  running  -        0.01  114.4 MiB  512.0 MiB  14.4 KiB/s  4.3 KiB/s  0 B/s  0 B/s       2
+```
+
+They ask the local collector on the port from `listen`, with the token from the config. `--url` and `--token-file` point them at another one. `collector health` exits 1 when the collector is stale or unreachable.
 
 ## Logs
 
@@ -113,13 +137,14 @@ With `api.token` or `api.token_file` set, requests need `Authorization: Bearer <
 - **Shutdown.** SIGTERM stops reading, sends pending multi-line groups, waits up to `shutdown_timeout` (10 s) for the last batch and saves cursors. Give the container a longer stop timeout than that (`stop_grace_period: 20s`).
 - **Skipped**: containers labeled `collector.logs=false` (`logs.exclude_label`), names matching `logs.exclude_names` and the collector itself.
 - **First run**: existing history is skipped (`logs.first_run = "end"`). Containers that start later are read from the beginning.
-- **Fields**: `_time`, `_msg`, `stream`, `host`, `container`, `container_id`, `image`, `compose_project`, `compose_service`, the labels kept by `containers.labels` and `containers.api_labels`, and `level` when the line is JSON with a recognizable level. Stream fields default to `host`, `container`, `compose_project`, `compose_service`.
+- **Fields**: `_time`, `_msg`, `stream`, `host`, `container`, `container_id`, `image`, `compose_project`, `compose_service`, the labels kept by `containers.labels` and `containers.api_labels`, and `level` when the line is JSON with a recognizable level. `compose_project` and `compose_service` come from the Compose labels whether or not those lists keep them. A label never replaces one of these fields. Stream fields default to `host`, `container`, `compose_project`, `compose_service`.
+- **Tenants**: with `logs.tenant_label` set, each container's logs go to the VictoriaLogs tenant (`AccountID`) in that Docker label. Each flush sends one request per tenant; unlabeled containers and non-numeric values go to tenant 0. Without it, everything goes to tenant 0 unless `logs.headers` sets an `AccountID`.
 
 Lines lost to Docker's own rotation, when a file rotates out of `max-file` before it's read, are counted in `collector_log_rotations_missed_total`.
 
 ## Remote write
 
-Each collection is encoded once (protobuf, snappy as the protocol requires) and queued. Failed pushes are retried in order with backoff up to `remote_write.max_backoff`; the queue holds up to `queue_bytes` (64 MiB; a push from a 20-container host is about 70 KB, so roughly seven hours) and drops the oldest first, counting them in `collector_remote_write_dropped_samples_total`. On SIGTERM the queue gets `shutdown_timeout` to drain.
+Remote write uses the clean metric names; set `metrics.compat = "cadvisor"` to push cAdvisor's. Each collection is encoded once (protobuf, snappy as the protocol requires) and queued. Failed pushes are retried in order with backoff up to `remote_write.max_backoff`; the queue holds up to `queue_bytes` (64 MiB; a push from a 20-container host is about 70 KB, so roughly seven hours) and drops the oldest first, counting them in `collector_remote_write_dropped_samples_total`. On SIGTERM the queue gets `shutdown_timeout` to drain.
 
 ## Build and release
 
