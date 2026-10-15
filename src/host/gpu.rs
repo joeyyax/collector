@@ -44,6 +44,8 @@ impl Watcher {
 
     fn run(&self, bin: &str, interval: Duration, auto: bool) {
         let mut backoff = Duration::from_secs(5);
+        // Auto mode gives up only if nvidia-smi never reported a GPU.
+        let mut seen = false;
         loop {
             let started = Instant::now();
             let mut lines = 0usize;
@@ -65,14 +67,15 @@ impl Watcher {
                     let _ = child.wait();
                 }
                 Err(e) => {
-                    if auto {
+                    if auto && !seen {
                         log::info!("gpu metrics off: {bin}: {e}");
                         return;
                     }
                     log::warn!("gpu: {bin}: {e}");
                 }
             }
-            if lines == 0 && auto {
+            seen |= lines > 0;
+            if !seen && auto {
                 log::info!("gpu metrics off: {bin} reported no GPUs");
                 return;
             }
