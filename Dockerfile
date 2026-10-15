@@ -26,4 +26,5 @@ COPY --from=build /collector /usr/local/bin/collector
 COPY deploy/collector.toml /etc/collector/collector.toml
 ENV COLLECTOR_CONFIG=/etc/collector/collector.toml
 EXPOSE 9273
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["/usr/local/bin/collector", "health"]
 ENTRYPOINT ["/usr/local/bin/collector"]

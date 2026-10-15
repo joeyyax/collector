@@ -1,5 +1,6 @@
 mod alloc;
 mod api;
+mod cli;
 mod config;
 mod containers;
 mod host;
@@ -28,6 +29,7 @@ pub const VERSION: &str = match option_env!("COLLECTOR_VERSION") {
 };
 
 const USAGE: &str = "usage: collector [--config FILE] [--once] [--version]
+       collector health|host|containers|gpus [options]   (collector health --help)
 
   --config FILE  TOML config (default: $COLLECTOR_CONFIG, else built-in defaults)
   --once         collect once, print /metrics output and exit
@@ -36,9 +38,18 @@ const USAGE: &str = "usage: collector [--config FILE] [--once] [--version]
 Every setting can be overridden with COLLECTOR_<KEY> or COLLECTOR_<SECTION>__<KEY>.";
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     let mut config_path = std::env::var("COLLECTOR_CONFIG").ok();
     let mut once = false;
+    if let Some(cmd) = args.peek().filter(|a| cli::COMMANDS.contains(&a.as_str())).cloned() {
+        args.next();
+        let rest: Vec<String> = args.collect();
+        if rest.iter().any(|a| a == "--help" || a == "-h") {
+            println!("{}", cli::USAGE);
+            return;
+        }
+        std::process::exit(cli::run(&cmd, rest.into_iter(), config_path.as_deref()));
+    }
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" | "-c" => config_path = args.next(),
