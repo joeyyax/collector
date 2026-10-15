@@ -562,8 +562,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn shipper() -> Shipper {
-        let mut cfg = Config::default();
-        cfg.host = "web-1".into();
+        let cfg = Config { host: "web-1".into(), ..Default::default() };
         Shipper::new(&cfg, Registry::new(), Arc::new(Stats::default()))
     }
 
