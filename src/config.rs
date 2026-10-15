@@ -173,6 +173,8 @@ pub struct Logs {
     pub compress: bool,
     /// Bound on lines queued from Docker logs API followers (local and journald drivers).
     pub api_queue_lines: usize,
+    /// Docker label holding a numeric VictoriaLogs AccountID per container; empty sends everything to tenant 0.
+    pub tenant_label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -316,6 +318,7 @@ impl Default for Logs {
             multiline: Multiline::default(),
             compress: true,
             api_queue_lines: 4096,
+            tenant_label: String::new(),
         }
     }
 }

@@ -66,8 +66,32 @@ enum Source {
 
 struct Tracked {
     meta: Arc<Container>,
+    tenant: u32,
     source: Source,
     gone: bool,
+}
+
+/// One flush's records, grouped by tenant.
+#[derive(Default)]
+struct Batch {
+    tenants: std::collections::BTreeMap<u32, (Vec<u8>, usize)>,
+    bytes: usize,
+    lines: usize,
+}
+
+impl Batch {
+    fn push(&mut self, tenant: u32, rec: &[u8]) {
+        let (body, lines) = self.tenants.entry(tenant).or_default();
+        body.extend_from_slice(rec);
+        body.push(b'\n');
+        *lines += 1;
+        self.bytes += rec.len() + 1;
+        self.lines += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines == 0
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -227,9 +251,11 @@ impl Shipper {
             if self.excluded(&c) {
                 continue;
             }
+            let tenant = self.tenant(&c, warned);
             if let Some(t) = tracked.get_mut(&c.id) {
                 t.gone = false;
                 t.meta = c;
+                t.tenant = tenant;
                 continue;
             }
             let skip_history = initial && self.cfg.first_run == StartAt::End;
@@ -271,7 +297,7 @@ impl Shipper {
                     continue;
                 }
             };
-            tracked.insert(c.id.clone(), Tracked { meta: c, source, gone: false });
+            tracked.insert(c.id.clone(), Tracked { meta: c, tenant, source, gone: false });
         }
         let live = tracked.values().filter(|t| !t.gone);
         let (mut files, mut api) = (0, 0);
@@ -284,6 +310,20 @@ impl Shipper {
         self.stats.followed.store(files, Ordering::Relaxed);
         self.stats.followed_api.store(api, Ordering::Relaxed);
         self.stats.unsupported.store(unsupported, Ordering::Relaxed);
+    }
+
+    /// The container's tenant from `logs.tenant_label`; 0 when unset, unlabeled or not a number.
+    fn tenant(&self, c: &Container, warned: &mut HashSet<String>) -> u32 {
+        if self.cfg.tenant_label.is_empty() {
+            return 0;
+        }
+        let Some(v) = c.all_labels.get(&self.cfg.tenant_label) else { return 0 };
+        v.trim().parse().unwrap_or_else(|_| {
+            if warned.insert(format!("tenant:{}", c.id)) {
+                log::warn!("logs: {} has {}={v:?}, which isn't a numeric AccountID; using tenant 0", c.name, self.cfg.tenant_label);
+            }
+            0
+        })
     }
 
     fn spawn_follower(&self, c: &Container, since_ns: u64, stop: Arc<AtomicBool>, tx: SyncSender<ApiLine>) {
@@ -322,12 +362,11 @@ impl Shipper {
         ids.sort();
         let deadline = Instant::now() + self.shutdown_timeout;
         loop {
-            let mut batch = Vec::with_capacity(64 << 10);
-            let mut lines = 0usize;
+            let mut batch = Batch::default();
             let mut full = false;
             let mut recs = Vec::new();
             let mut api_recs = Vec::new();
-            let limit = |b: &Vec<u8>, l: usize| b.len() >= self.cfg.batch_bytes || l >= self.cfg.batch_lines;
+            let limit = |b: &Batch| b.bytes >= self.cfg.batch_bytes || b.lines >= self.cfg.batch_lines;
 
             if !stopping {
                 while !full {
@@ -346,9 +385,9 @@ impl Shipper {
                             *replay_ns = None;
                         }
                         for r in api_recs.drain(..) {
-                            self.append(&mut batch, &mut lines, &t.meta, &r.stream, &r.time, &r.msg);
+                            self.append(&mut batch, t.tenant, &t.meta, &r.stream, &r.time, &r.msg);
                         }
-                        full = limit(&batch, lines);
+                        full = limit(&batch);
                     }
                 }
 
@@ -379,11 +418,11 @@ impl Shipper {
                             }
                         }
                         for r in recs.drain(..) {
-                            self.append(&mut batch, &mut lines, &t.meta, &r.stream, &r.time, &r.msg);
+                            self.append(&mut batch, t.tenant, &t.meta, &r.stream, &r.time, &r.msg);
                         }
                     }
                     *read = chunk.cursor;
-                    if limit(&batch, lines) {
+                    if limit(&batch) {
                         full = true;
                         *rr = (*rr + k + 1) % n;
                     }
@@ -399,12 +438,12 @@ impl Shipper {
                     _ => {}
                 }
                 for r in out {
-                    self.append(&mut batch, &mut lines, &t.meta, &r.stream, &r.time, &r.msg);
+                    self.append(&mut batch, t.tenant, &t.meta, &r.stream, &r.time, &r.msg);
                 }
             }
 
             let commits: Vec<(String, Commit)> = tracked.iter().filter_map(|(id, t)| commit_for(t).map(|c| (id.clone(), c))).filter(|(id, c)| !same(state, id, c)).collect();
-            let delivered = batch.is_empty() || self.send(sink, &batch, lines, stopping.then_some(deadline));
+            let delivered = batch.is_empty() || self.send_all(sink, &batch, stopping.then_some(deadline));
             if !delivered {
                 return false;
             }
@@ -429,11 +468,17 @@ impl Shipper {
         }
     }
 
+    /// Sends each tenant's records as its own request; cursors move only once all are delivered.
+    fn send_all(&self, sink: &mut dyn sink::Sink, batch: &Batch, deadline: Option<Instant>) -> bool {
+        let tenant = |t: u32| (!self.cfg.tenant_label.is_empty()).then_some(t);
+        batch.tenants.iter().all(|(t, (body, lines))| self.send(sink, body, *lines, tenant(*t), deadline))
+    }
+
     /// Retries until the sink accepts the batch; the log files are the buffer. Gives up only past `deadline`.
-    fn send(&self, sink: &mut dyn sink::Sink, batch: &[u8], lines: usize, mut deadline: Option<Instant>) -> bool {
+    fn send(&self, sink: &mut dyn sink::Sink, batch: &[u8], lines: usize, tenant: Option<u32>, mut deadline: Option<Instant>) -> bool {
         let mut backoff = Duration::from_millis(500);
         loop {
-            match sink.send(batch) {
+            match sink.send(batch, tenant) {
                 Ok(()) => {
                     self.stats.lines.fetch_add(lines as u64, Ordering::Relaxed);
                     self.stats.bytes.fetch_add(batch.len() as u64, Ordering::Relaxed);
@@ -457,11 +502,9 @@ impl Shipper {
         }
     }
 
-    fn append(&self, batch: &mut Vec<u8>, lines: &mut usize, c: &Container, stream: &str, time: &str, msg: &str) {
+    fn append(&self, batch: &mut Batch, tenant: u32, c: &Container, stream: &str, time: &str, msg: &str) {
         if let Some(rec) = self.encode(c, stream, time, msg) {
-            batch.extend_from_slice(&rec);
-            batch.push(b'\n');
-            *lines += 1;
+            batch.push(tenant, &rec);
         }
     }
 
@@ -597,5 +640,63 @@ mod tests {
         assert_eq!(f["host"], "web-1");
         assert_eq!(f["_msg"], "hi");
         assert_eq!(f["team"], "a");
+    }
+
+    type Sent = Vec<(Option<u32>, Vec<String>)>;
+
+    struct Recorder(Arc<std::sync::Mutex<Sent>>);
+
+    impl sink::Sink for Recorder {
+        fn send(&mut self, body: &[u8], tenant: Option<u32>) -> Result<(), String> {
+            let names = String::from_utf8_lossy(body).lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["container"].as_str().unwrap().to_string()).collect();
+            self.0.lock().unwrap().push((tenant, names));
+            Ok(())
+        }
+    }
+
+    /// Drains one flush of json-file logs for containers labeled with `tenants` and returns each request's tenant and container names.
+    fn flush(tenant_label: &str, tenants: &[(&str, Option<&str>)]) -> Sent {
+        let root = std::env::temp_dir().join(format!("collector-tenants-{}-{}", std::process::id(), tenant_label.len()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config { host: "web-1".into(), ..Default::default() };
+        cfg.paths.state_dir = root.join("state");
+        cfg.logs.tenant_label = tenant_label.into();
+        std::fs::create_dir_all(&cfg.paths.state_dir).unwrap();
+        let shipper = Shipper::new(&cfg, Registry::new(), Arc::new(Stats::default()));
+        let mut tracked = HashMap::new();
+        let mut warned = HashSet::new();
+        for (i, (name, label)) in tenants.iter().enumerate() {
+            let id = format!("{i:x}").repeat(64);
+            let path = root.join(format!("{id}-json.log"));
+            std::fs::write(&path, format!("{{\"log\":\"hello from {name}\\n\",\"stream\":\"stdout\",\"time\":\"2026-10-10T12:00:00.{i}Z\"}}\n")).unwrap();
+            let all_labels = label.iter().map(|v| ("com.example.tenant".to_string(), v.to_string())).collect();
+            let c = Container { id: id.clone(), name: name.to_string(), all_labels, ..Default::default() };
+            let read = cursor::initial(&path, Start::Beginning).unwrap();
+            let tenant = shipper.tenant(&c, &mut warned);
+            tracked.insert(id, Tracked { meta: Arc::new(c), tenant, source: Source::File { path, read, replay: None, asm: Assembler::default() }, gone: false });
+        }
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (_tx, rx) = sync_channel::<ApiLine>(1);
+        let ok = shipper.drain(&mut Recorder(sent.clone()), &mut tracked, &mut State::default(), &rx, &mut 0, false);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(ok);
+        let mut out = sent.lock().unwrap().clone();
+        for (_, names) in &mut out {
+            names.sort();
+        }
+        out
+    }
+
+    #[test]
+    fn one_request_per_tenant_per_flush() {
+        let got = flush("com.example.tenant", &[("a", Some("7")), ("b", Some("3")), ("c", None), ("d", Some("7")), ("e", Some("x"))]);
+        let want = vec![(Some(0), vec!["c".to_string(), "e".to_string()]), (Some(3), vec!["b".to_string()]), (Some(7), vec!["a".to_string(), "d".to_string()])];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn without_tenant_label_one_request_without_account_id() {
+        let got = flush("", &[("a", Some("7")), ("b", None)]);
+        assert_eq!(got, vec![(None, vec!["a".to_string(), "b".to_string()])]);
     }
 }

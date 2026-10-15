@@ -2,7 +2,8 @@ use crate::config::{LogSink, Logs};
 use std::io::Write;
 
 pub trait Sink: Send {
-    fn send(&mut self, ndjson: &[u8]) -> Result<(), String>;
+    /// Sends one batch; `tenant` is the VictoriaLogs AccountID when `logs.tenant_label` is set.
+    fn send(&mut self, ndjson: &[u8], tenant: Option<u32>) -> Result<(), String>;
 }
 
 pub fn build(cfg: &Logs) -> Result<Box<dyn Sink>, String> {
@@ -38,10 +39,13 @@ impl VictoriaLogs {
 }
 
 impl Sink for VictoriaLogs {
-    fn send(&mut self, body: &[u8]) -> Result<(), String> {
+    fn send(&mut self, body: &[u8], tenant: Option<u32>) -> Result<(), String> {
         let mut req = self.agent.post(&self.url).set("Content-Type", "application/stream+json");
         for (k, v) in &self.headers {
             req = req.set(k, v);
+        }
+        if let Some(t) = tenant {
+            req = req.set("AccountID", &t.to_string());
         }
         let gz;
         let body = if self.compress {
@@ -64,7 +68,7 @@ pub struct FileSink {
 }
 
 impl Sink for FileSink {
-    fn send(&mut self, body: &[u8]) -> Result<(), String> {
+    fn send(&mut self, body: &[u8], _tenant: Option<u32>) -> Result<(), String> {
         self.f.write_all(body).and_then(|_| self.f.flush()).map_err(|e| format!("log file: {e}"))
     }
 }
