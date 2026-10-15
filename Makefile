@@ -4,6 +4,10 @@ IMAGE ?= ghcr.io/joeyyax/collector
 PLATFORMS ?= linux/amd64,linux/arm64
 ZIGBUILD ?= ghcr.io/rust-cross/cargo-zigbuild:0.23.4
 BUILDER ?= collector-builder
+# Index annotations so GHCR links the multi-arch package to the repo.
+ANNOTATIONS = --annotation "index:org.opencontainers.image.source=https://github.com/joeyyax/collector" \
+	--annotation "index:org.opencontainers.image.description=Host, container and GPU metrics plus container logs from one small binary" \
+	--annotation "index:org.opencontainers.image.licenses=MIT"
 
 RUN = docker run --rm -v "$(CURDIR)":/src -w /src -v collector-cargo:/usr/local/cargo/registry \
 	-e CARGO_TARGET_DIR=/src/target/docker -e COLLECTOR_VERSION=$(VERSION) $(ZIGBUILD)
@@ -39,11 +43,11 @@ $(BUILDER):
 # Multi-arch image as an OCI archive in dist/; nothing is pushed.
 image: $(BUILDER)
 	mkdir -p dist
-	docker buildx build --builder $(BUILDER) --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) \
+	docker buildx build --builder $(BUILDER) --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) $(ANNOTATIONS) \
 		-t $(IMAGE):$(VERSION) --output type=oci,dest=dist/collector-$(VERSION).oci.tar .
 
 image-push: $(BUILDER)
-	docker buildx build --builder $(BUILDER) --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) \
+	docker buildx build --builder $(BUILDER) --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) $(ANNOTATIONS) \
 		-t $(IMAGE):$(VERSION) -t $(IMAGE):latest --push .
 
 clean:
