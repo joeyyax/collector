@@ -13,7 +13,7 @@ Breaking: container metrics use clean names by default. See [Migrating from 0.2]
 - `GET /api/v1/stream`: each snapshot as a server-sent event. Collection runs every `live_interval` (5 s) while anyone follows it.
 - `GET /api/v1/gpus`: GPUs with the containers holding memory on each, or `null` when per-container GPU memory isn't read. `/health` adds `gpu_per_container`.
 - `sort` and `limit` on `/api/v1/containers`, the snapshot and the stream.
-- Containers report disk read and write rates, and `compose_project` and `compose_service` as plain fields.
+- Containers report disk read and write rates. `compose_project` and `compose_service` are plain fields.
 - Writable-layer size, off by default: `containers.writable_layer` measures one container at a time so a pass takes `writable_layer_interval` (1 h). `container_writable_layer_bytes` and `writable_layer` in the API.
 - `logs.tenant_label`: send each container's logs to the VictoriaLogs tenant in that label, one request per tenant per flush.
 - Host metrics: `node_uname_info`, `node_time_seconds`, `node_vmstat_{oom_kill,pgmajfault,pswpin,pswpout}`, `node_pressure_*`, `node_network_{up,speed_bytes,mtu_bytes}`, `node_filefd_*` and `node_nf_conntrack_entries{,_limit}`. Containers add `container_pressure_*`. Each is left out when its file is missing.

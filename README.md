@@ -98,7 +98,7 @@ The binary listens on `127.0.0.1:9273` by default (`listen`). The image sets `0.
 | `GET /api/v1/stream` | token | The snapshot as server-sent events; collection runs every `live_interval` (5 s) while anyone follows |
 | `GET /api/v1/host` | token | Host snapshot with derived rates |
 | `GET /api/v1/containers` | token | Every running container with its latest readings |
-| `GET /api/v1/containers/:id` | token | One container by full ID, name, or unique ID prefix of four or more characters |
+| `GET /api/v1/containers/:id` | token | One container by full ID, name or unique ID prefix of four or more characters |
 | `GET /api/v1/gpus` | token | GPUs with the containers holding memory on each |
 
 Container lists, the snapshot and the stream take `sort` (`cpu`, `memory`, `net_rx`, `net_tx`, `disk_read`, `disk_write`, `name`) and `limit`, so `/api/v1/containers?sort=cpu&limit=10` is the ten busiest.

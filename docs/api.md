@@ -27,7 +27,7 @@ The collector keeps no history. Each response is the latest collection only.
 | `limit` | same | Keep the first N containers after sorting |
 | `compat` | `/metrics` | `cadvisor` renders cAdvisor's metric names and labels; `none` (the default) renders clean names |
 
-Sorting is descending except for `name`. `cpu` is `usage_cores`, `memory` is `working_set_bytes`, and the others sum the per-interface or per-device rates. Containers without a reading yet, such as after their first collection, and host-network containers sorted by network go last; ties go by name. An unknown value answers 400.
+Sorting is descending except for `name`. `cpu` is `usage_cores` and `memory` is `working_set_bytes`; the others sum the per-interface or per-device rates. Containers without a reading yet, such as after their first collection, and host-network containers sorted by network go last; ties go by name. An unknown value answers 400.
 
 ## `GET /health`
 
@@ -125,7 +125,7 @@ An array of the objects below, sorted by name unless `sort` says otherwise.
 
 ## `GET /api/v1/containers/:id`
 
-`:id` is the full container ID, the name, or a unique ID prefix of at least four characters. 404 with `{"error": "container not found"}` or `{"error": "ambiguous id prefix"}` otherwise. Only running containers are found.
+`:id` is the full container ID, the name or a unique ID prefix of at least four characters. 404 with `{"error": "container not found"}` or `{"error": "ambiguous id prefix"}` otherwise. Only running containers are found.
 
 ```json
 {
