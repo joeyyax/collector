@@ -1,3 +1,4 @@
+use crate::containers::ContainerSnapshot;
 use crate::logs::Stats as LogStats;
 use crate::metrics::{MetricSet, TextReader};
 use std::io::Read;
@@ -80,7 +81,10 @@ impl Api {
                 Some(h) => json(200, h),
                 None => json(503, &Error { error: "no data yet" }),
             },
-            "/api/v1/containers" => json(200, &self.shared.read().containers),
+            "/api/v1/containers" => {
+                let snap = self.shared.read();
+                json(200, &snap.containers.iter().map(|c| self.item(c, snap.collected_at)).collect::<Vec<_>>())
+            }
             p if p.starts_with("/api/v1/containers/") => {
                 let key = &p["/api/v1/containers/".len()..];
                 let snap = self.shared.read();
@@ -90,7 +94,7 @@ impl Api {
                     .find(|c| c.meta.id == key || c.meta.name == key)
                     .or_else(|| if key.len() >= 4 { snap.containers.iter().find(|c| c.meta.id.starts_with(key)) } else { None });
                 match found {
-                    Some(c) => json(200, c),
+                    Some(c) => json(200, &self.item(c, snap.collected_at)),
                     None => json(404, &Error { error: "container not found" }),
                 }
             }
@@ -98,6 +102,10 @@ impl Api {
             _ => json(404, &Error { error: "not found" }),
         };
         let _ = req.respond(res);
+    }
+
+    fn item<'a>(&self, c: &'a ContainerSnapshot, collected_at: f64) -> ContainerItem<'a> {
+        ContainerItem { c, collected_at: millis(collected_at), interval_seconds: self.interval.as_secs_f64() }
     }
 
     /// Streams the last collection, then the collector's own metrics.
@@ -140,7 +148,9 @@ impl Api {
             status: if fresh { "ok" } else { "stale" },
             version: VERSION,
             host: snap.host.as_ref().map(|h| h.host.clone()).unwrap_or_default(),
-            last_collect_age_seconds: if snap.collected_at > 0.0 { Some((age * 1000.0).round() / 1000.0) } else { None },
+            last_collect_age_seconds: (snap.collected_at > 0.0).then(|| millis(age)),
+            collected_at: (snap.collected_at > 0.0).then(|| millis(snap.collected_at)),
+            interval_seconds: self.interval.as_secs_f64(),
             docker: self.containers_enabled.then(|| self.docker_ok.load(std::sync::atomic::Ordering::Relaxed)),
             logs_last_success: self.log_stats.as_ref().map(|s| s.last_success.load(std::sync::atomic::Ordering::Relaxed)),
         };
@@ -159,10 +169,25 @@ struct Health {
     version: &'static str,
     host: String,
     last_collect_age_seconds: Option<f64>,
+    collected_at: Option<f64>,
+    interval_seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     docker: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     logs_last_success: Option<u64>,
+}
+
+/// A container with the time and interval of the collection it came from.
+#[derive(Serialize)]
+struct ContainerItem<'a> {
+    #[serde(flatten)]
+    c: &'a ContainerSnapshot,
+    collected_at: f64,
+    interval_seconds: f64,
+}
+
+fn millis(secs: f64) -> f64 {
+    (secs * 1000.0).round() / 1000.0
 }
 
 fn text(code: u16, body: &str, ctype: &str) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -189,5 +214,15 @@ mod tests {
         assert!(constant_eq(b"Bearer abc", b"Bearer abc"));
         assert!(!constant_eq(b"Bearer abd", b"Bearer abc"));
         assert!(!constant_eq(b"Bearer ab", b"Bearer abc"));
+    }
+
+    #[test]
+    fn container_items_carry_freshness() {
+        let c = ContainerSnapshot { meta: Arc::new(crate::containers::Container { name: "shop-web".into(), ..Default::default() }), ..Default::default() };
+        let v = serde_json::to_value(ContainerItem { c: &c, collected_at: millis(1791656309.73149), interval_seconds: 60.0 }).unwrap();
+        assert_eq!(v["name"], "shop-web");
+        assert_eq!(v["collected_at"], 1791656309.731);
+        assert_eq!(v["interval_seconds"], 60.0);
+        assert!(v["gpus"].as_array().unwrap().is_empty());
     }
 }

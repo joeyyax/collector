@@ -14,7 +14,7 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Container {
     pub id: String,
     pub name: String,
@@ -245,7 +245,7 @@ pub fn keep_label(patterns: &[String], key: &str) -> bool {
     })
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ContainerSnapshot {
     #[serde(flatten)]
     pub meta: Arc<Container>,

@@ -2,17 +2,17 @@
 
 Read-only, `GET` only, on `127.0.0.1:9273` unless `listen` says otherwise. With `api.token` or `api.token_file` set, every endpoint except `/health` needs `Authorization: Bearer <token>` and answers 401 without it. `/metrics` is gzipped when the client sends `Accept-Encoding: gzip`, as Prometheus and VictoriaMetrics do.
 
-Every response reflects the last collection (every `interval`, 15 s by default); nothing is read from the host on request.
+Every response reflects the last collection (every `interval`, 15 s by default); nothing is read from the host on request. `/health` and each container carry `collected_at`, the Unix time of that collection in seconds, and `interval_seconds`, the configured interval. Judge staleness against `interval_seconds` rather than a fixed 15 s.
 
 Rates (`*_per_second`, `usage_ratio`, `usage_cores`, `busy_ratio`) cover the time between the last two collections. They're `null` after the first collection and after a counter reset.
 
 ## `GET /health`
 
 ```json
-{"status": "ok", "version": "0.1.0", "host": "web-1", "last_collect_age_seconds": 3.2, "docker": true, "logs_last_success": 1791656289}
+{"status": "ok", "version": "0.2.0", "host": "web-1", "last_collect_age_seconds": 3.2, "collected_at": 1791656309.731, "interval_seconds": 15.0, "docker": true, "logs_last_success": 1791656289}
 ```
 
-`status` is `stale` with HTTP 503 when the last collection is older than three intervals. `docker` is present when container metrics are on, `logs_last_success` (epoch seconds) when logs are on.
+`status` is `stale` with HTTP 503 when the last collection is older than three intervals. `last_collect_age_seconds` and `collected_at` are `null` before the first collection. `docker` is present when container metrics are on, `logs_last_success` (epoch seconds) when logs are on.
 
 ## `GET /api/v1/host`
 
@@ -87,7 +87,9 @@ An array of the objects below, sorted by name.
   "network": [{"interface": "eth0", "receive_bytes_total": 311769077, "transmit_bytes_total": 1519029101,
                "receive_bytes_per_second": 14723.5, "transmit_bytes_per_second": 4361.8}],
   "pids": {"current": 9, "limit": 76881},
-  "gpus": [{"uuid": "00000000-0000-0000-0000-000000000000", "memory_used_bytes": 1658847232}]
+  "gpus": [{"uuid": "00000000-0000-0000-0000-000000000000", "memory_used_bytes": 1658847232}],
+  "collected_at": 1791656309.731,
+  "interval_seconds": 15.0
 }
 ```
 
