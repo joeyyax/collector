@@ -481,7 +481,7 @@ impl Shipper {
             rec.insert("compose_service".into(), Value::String(s.to_string()));
         }
         for (k, v) in c.labels.iter().filter(|(k, _)| !k.starts_with("com.docker.compose.")) {
-            rec.insert(k.clone(), Value::String(v.clone()));
+            rec.entry(k.clone()).or_insert_with(|| Value::String(v.clone()));
         }
         if (self.cfg.parse_level || !self.cfg.promote_fields.is_empty()) && msg.trim_start().starts_with('{') {
             if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(msg) {
@@ -554,4 +554,46 @@ fn own_container_id() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn shipper() -> Shipper {
+        let mut cfg = Config::default();
+        cfg.host = "web-1".into();
+        Shipper::new(&cfg, Registry::new(), Arc::new(Stats::default()))
+    }
+
+    fn fields(s: &Shipper, c: &Container) -> Map<String, Value> {
+        match serde_json::from_slice(&s.encode(c, "stdout", "2026-10-10T12:00:00Z", "hi").unwrap()).unwrap() {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn compose_fields_survive_dropped_compose_labels() {
+        let all: BTreeMap<String, String> = [("com.docker.compose.project", "shop"), ("com.docker.compose.service", "web"), ("com.example.team", "a")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let c = Container { id: "a".repeat(64), name: "shop-web-1".into(), all_labels: all, ..Default::default() };
+        let f = fields(&shipper(), &c);
+        assert_eq!(f["compose_project"], "shop");
+        assert_eq!(f["compose_service"], "web");
+        assert!(!f.contains_key("com.example.team"));
+    }
+
+    #[test]
+    fn labels_never_replace_record_fields() {
+        let kept: BTreeMap<String, String> = [("host", "spoofed"), ("_msg", "spoofed"), ("team", "a")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let c = Container { id: "b".repeat(64), name: "web".into(), labels: kept.clone(), all_labels: kept, ..Default::default() };
+        let f = fields(&shipper(), &c);
+        assert_eq!(f["host"], "web-1");
+        assert_eq!(f["_msg"], "hi");
+        assert_eq!(f["team"], "a");
+    }
 }

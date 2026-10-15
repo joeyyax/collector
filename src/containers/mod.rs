@@ -44,10 +44,10 @@ impl Container {
         self.labels.get(k).map(String::as_str)
     }
     pub fn compose_project(&self) -> Option<&str> {
-        self.label("com.docker.compose.project")
+        self.all_labels.get("com.docker.compose.project").map(String::as_str)
     }
     pub fn compose_service(&self) -> Option<&str> {
-        self.label("com.docker.compose.service")
+        self.all_labels.get("com.docker.compose.service").map(String::as_str)
     }
     pub fn short_id(&self) -> &str {
         &self.id[..self.id.len().min(12)]
