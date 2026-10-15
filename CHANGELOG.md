@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+- Per-container GPU memory from a second long-running `nvidia-smi --query-compute-apps` process: `gpus` in the containers API and `container_accelerator_memory_used_bytes`. Needs `pid: host`.
+- `collected_at` and `interval_seconds` on `/health` and on each container in the API.
+- `containers.api_labels`: labels kept on the JSON API and log fields but never on metrics.
+- Image index annotations for source, description and license, so GHCR links the package to the repo.
+- Auto GPU mode no longer turns GPU metrics off for good when `nvidia-smi` restarts and reports nothing.
+- Images built without `VERSION` report the crate version instead of an empty one.
+
 ## 0.1.0
 
 First release.
