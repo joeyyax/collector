@@ -7,8 +7,8 @@ ENV COLLECTOR_VERSION=$VERSION
 WORKDIR /src
 COPY Cargo.toml Cargo.lock collector.example.toml ./
 COPY src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
     case "$TARGETARCH" in \
       amd64) t=x86_64-unknown-linux-musl ;; \
       arm64) t=aarch64-unknown-linux-musl; export JEMALLOC_SYS_WITH_LG_PAGE=16 ;; \
