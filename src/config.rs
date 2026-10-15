@@ -109,6 +109,11 @@ pub struct Containers {
     pub api_labels: Vec<String>,
     #[serde(with = "dur")]
     pub resync: Duration,
+    /// Measure each container's writable layer, one container at a time.
+    pub writable_layer: bool,
+    /// Time for one pass over every container.
+    #[serde(with = "dur")]
+    pub writable_layer_interval: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,6 +281,8 @@ impl Default for Containers {
             ],
             api_labels: Vec::new(),
             resync: Duration::from_secs(300),
+            writable_layer: false,
+            writable_layer_interval: Duration::from_secs(3600),
         }
     }
 }

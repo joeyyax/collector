@@ -75,7 +75,8 @@ fn main() {
         gpu::Watcher::start(&cfg.gpu.nvidia_smi, cfg.interval, cfg.gpu.enabled == Toggle::Auto, per_process)
     });
     let mut host = cfg.host_metrics.enabled.then(|| host::HostCollector::new(&cfg, gpu.clone()));
-    let mut ctrs = cfg.containers.enabled.then(|| containers::ContainerCollector::new(&cfg, registry.clone(), gpu.clone()));
+    let sizes = containers::layer::Sizes::default();
+    let mut ctrs = cfg.containers.enabled.then(|| containers::ContainerCollector::new(&cfg, registry.clone(), gpu.clone(), sizes.clone()));
     let shared = Shared::default();
 
     if once {
@@ -90,6 +91,10 @@ fn main() {
 
     // Every thread inherits this mask, so only the main thread's sigwait sees SIGTERM and SIGINT.
     let signals = signals::block();
+
+    if cfg.containers.enabled && cfg.containers.writable_layer {
+        sizes.start(registry.clone(), cfg.paths.rootfs.clone(), cfg.containers.writable_layer_interval);
+    }
 
     let log_stats = cfg.logs.enabled.then(|| Arc::new(logs::Stats::default()));
     if let Some(stats) = &log_stats {

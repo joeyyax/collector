@@ -37,6 +37,14 @@ pub struct Inspect {
     pub host_config: HostConfig,
     #[serde(rename = "Config", default)]
     pub config: ContainerConfig,
+    #[serde(rename = "GraphDriver", default)]
+    pub graph_driver: GraphDriver,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GraphDriver {
+    #[serde(rename = "Data", default)]
+    pub data: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -349,6 +357,10 @@ mod tests {
         assert_eq!(i.host_config.log_config.kind, "json-file");
         assert_eq!(i.config.labels.unwrap()["com.docker.compose.project"], "shop");
         assert!(i.state.health.is_none());
+        assert!(i.graph_driver.data.is_none());
+        let j = r#"{"Id":"abc","State":{},"GraphDriver":{"Data":{"LowerDir":"/var/lib/docker/overlay2/x-init/diff","MergedDir":"/var/lib/docker/overlay2/x/merged","UpperDir":"/var/lib/docker/overlay2/x/diff","WorkDir":"/var/lib/docker/overlay2/x/work"},"Name":"overlay2"}}"#;
+        let i: Inspect = serde_json::from_str(j).unwrap();
+        assert_eq!(i.graph_driver.data.unwrap()["UpperDir"], "/var/lib/docker/overlay2/x/diff");
     }
 
     #[test]

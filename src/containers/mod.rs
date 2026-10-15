@@ -1,5 +1,6 @@
 pub mod cgroup;
 pub mod docker;
+pub mod layer;
 pub mod lifecycle;
 
 use crate::config::{self, Config};
@@ -47,6 +48,9 @@ pub struct Container {
     pub health: Option<String>,
     #[serde(skip)]
     pub restart_count: u64,
+    /// Host path of the overlay upper directory.
+    #[serde(skip)]
+    pub upper_dir: Option<String>,
 }
 
 pub const COMPOSE_PROJECT: &str = "com.docker.compose.project";
@@ -270,6 +274,11 @@ pub(crate) fn build(i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &conf
         status: i.state.status,
         health: i.state.health.map(|h| h.status).filter(|h| !h.is_empty()),
         restart_count: i.restart_count,
+        upper_dir: i
+            .graph_driver
+            .data
+            .and_then(|mut d| d.remove("UpperDir"))
+            .or_else(|| (i.state.pid > 0).then(|| read(proc.join(format!("{}/mountinfo", i.state.pid))).and_then(|t| layer::upper_dir_from_mountinfo(&t))).flatten()),
         id: i.id,
         ..Default::default()
     };
@@ -314,6 +323,8 @@ pub struct ContainerSnapshot {
     pub network: Vec<NetOut>,
     pub pids: PidsOut,
     pub gpus: Vec<GpuOut>,
+    /// Null until measured, and always without `containers.writable_layer`.
+    pub writable_layer: Option<layer::Size>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -407,11 +418,12 @@ pub struct ContainerCollector {
     prev: HashMap<String, Prev>,
     devices: HashMap<(u32, u32), String>,
     gpu: Option<gpu::Watcher>,
+    sizes: layer::Sizes,
 }
 
 impl ContainerCollector {
-    pub fn new(cfg: &Config, registry: Registry, gpu: Option<gpu::Watcher>) -> Self {
-        Self { registry, proc: cfg.paths.proc.clone(), sys: cfg.paths.sys.clone(), network: cfg.containers.network, prev: HashMap::new(), devices: HashMap::new(), gpu }
+    pub fn new(cfg: &Config, registry: Registry, gpu: Option<gpu::Watcher>, sizes: layer::Sizes) -> Self {
+        Self { registry, proc: cfg.paths.proc.clone(), sys: cfg.paths.sys.clone(), network: cfg.containers.network, prev: HashMap::new(), devices: HashMap::new(), gpu, sizes }
     }
 
     pub fn collect(&mut self, m: &mut MetricSet) -> Collected {
@@ -548,8 +560,13 @@ impl ContainerCollector {
                 m.push_with("container_gpu_memory_used_bytes", "GPU memory held by the container's processes.", Kind::Gauge, l, &[("uuid", &g.uuid)], g.memory_used_bytes as f64);
             }
 
+            let writable_layer = self.sizes.get(&c.id);
+            if let Some(w) = writable_layer {
+                put(m, "container_writable_layer_bytes", "Bytes in the container's writable layer, measured up to containers.writable_layer_interval ago.", Kind::Gauge, l, w.bytes as f64);
+            }
+
             next_prev.insert(c.id.clone(), Prev { at: now, usage_usec: raw.cpu.usage_usec, net: net_prev, io: io_prev });
-            out.push(ContainerSnapshot { meta: c.clone(), lifecycle: life, cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max }, gpus });
+            out.push(ContainerSnapshot { meta: c.clone(), lifecycle: life, cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max }, gpus, writable_layer });
         }
         self.prev = next_prev;
         let stopped = stopped
@@ -726,8 +743,10 @@ mod tests {
         let registry = Registry::new();
         registry.inner.write().unwrap().insert(c.id.clone(), Arc::new(c));
         let gpu = gpu::Watcher::with_apps(cfg.interval, vec![gpu::App { pid: 4242, uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
+        let sizes = layer::Sizes::default();
+        sizes.set(&id, layer::Size { bytes: 4096, measured_at: 1.5 });
         let mut m = MetricSet::new();
-        let snaps = ContainerCollector::new(&cfg, registry, Some(gpu)).collect(&mut m).running;
+        let snaps = ContainerCollector::new(&cfg, registry, Some(gpu), sizes).collect(&mut m).running;
         let _ = std::fs::remove_dir_all(&root);
 
         let text = m.render(&[], config::Compat::None);
@@ -743,6 +762,8 @@ mod tests {
         assert!(!old.contains("com_example") && !old.contains("container_id="));
         assert_eq!(snaps[0].meta.labels.keys().collect::<Vec<_>>(), ["com.docker.compose.project", "com.example.deploy-id", "com.example.owner"]);
         assert_eq!(snaps[0].gpus, vec![GpuOut { uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
+        assert!(text.contains(r#"container_writable_layer_bytes{container="shop-web",container_id="cccccccccccc",image="shop/web:1",compose_project="shop"} 4096"#));
+        assert_eq!(serde_json::to_value(&snaps[0]).unwrap()["writable_layer"], serde_json::json!({"bytes": 4096, "measured_at": 1.5}));
     }
 
     #[test]
@@ -769,7 +790,7 @@ mod tests {
         registry.life.lock().unwrap().stopped(Arc::new(gone), Some(&st), util::now_secs());
 
         let mut m = MetricSet::new();
-        let got = ContainerCollector::new(&cfg, registry, None).collect(&mut m);
+        let got = ContainerCollector::new(&cfg, registry, None, layer::Sizes::default()).collect(&mut m);
         let text = m.render(&[], config::Compat::None);
         let has = |line: &str| text.lines().any(|l| l == line);
         let web_l = format!(r#"container="web",container_id="{}",image="app:1""#, &web[..12]);
