@@ -21,10 +21,10 @@ use util::log;
 #[global_allocator]
 static GLOBAL: alloc::Counting = alloc::Counting;
 
-/// Release version: COLLECTOR_VERSION at build time, else the crate version.
+/// Release version: COLLECTOR_VERSION at build time, else the crate version. The Dockerfile sets it empty when no VERSION is given.
 pub const VERSION: &str = match option_env!("COLLECTOR_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
 };
 
 const USAGE: &str = "usage: collector [--config FILE] [--once] [--version]
