@@ -60,7 +60,7 @@ pub fn run(cmd: &str, args: impl Iterator<Item = String>, config_path: Option<&s
     let (status, body) = match get(&url, &token) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("collector: {url}: {e}");
+            eprintln!("collector: {e}");
             return 1;
         }
     };
