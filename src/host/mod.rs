@@ -3,7 +3,7 @@ pub mod gpu;
 pub mod hwmon;
 pub mod procfs;
 
-use crate::config::{Config, Toggle};
+use crate::config::Config;
 use crate::metrics::{Kind, LabelSet, MetricSet};
 use crate::util::{self, matches, rate, read};
 use procfs::{CpuTimes, DiskStat, NetDev, CPU_MODES};
@@ -123,7 +123,7 @@ const H_CPU: &str = "Seconds the CPUs spent in each mode.";
 const H_GUEST: &str = "Seconds the CPUs spent in guests (VMs) for each mode.";
 
 impl HostCollector {
-    pub fn new(cfg: &Config) -> Self {
+    pub fn new(cfg: &Config, gpu: Option<gpu::Watcher>) -> Self {
         let h = &cfg.host_metrics;
         Self {
             proc: cfg.paths.proc.clone(),
@@ -132,7 +132,7 @@ impl HostCollector {
             host: cfg.host.clone(),
             per_cpu: h.per_cpu,
             hwmon: h.hwmon,
-            gpu: (cfg.gpu.enabled != Toggle::Off).then(|| gpu::Watcher::start(&cfg.gpu.nvidia_smi, cfg.interval, cfg.gpu.enabled == Toggle::Auto)),
+            gpu,
             fs_types: util::regex(&h.filesystem_exclude_types),
             fs_mounts: util::regex(&h.filesystem_exclude_mounts),
             disk_exclude: util::regex(&h.disk_exclude),

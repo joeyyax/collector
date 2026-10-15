@@ -159,6 +159,18 @@ pub fn find_dir(cgroup_root: &Path, id: &str, proc: &Path, pid: u32) -> Option<P
     None
 }
 
+/// The first Docker container id in a `/proc/<pid>/cgroup` file that `known` accepts. Handles cgroup v1, v2 and namespace-relative paths (`0::/../docker-<id>.scope`).
+pub fn container_id(text: &str, known: impl Fn(&str) -> bool) -> Option<&str> {
+    text.lines()
+        .filter_map(|l| l.splitn(3, ':').nth(2))
+        .flat_map(|p| p.split('/'))
+        .map(|c| {
+            let c = c.strip_prefix("docker-").unwrap_or(c);
+            c.strip_suffix(".scope").unwrap_or(c)
+        })
+        .find(|c| c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()) && known(c))
+}
+
 /// Maps "major:minor" to block device names from /sys/dev/block.
 pub fn block_device_name(sys: &Path, major: u32, minor: u32) -> Option<String> {
     let uevent = read(sys.join(format!("dev/block/{major}:{minor}/uevent")))?;
@@ -218,5 +230,20 @@ mod tests {
         assert_eq!(r.pids, 7);
         assert!(find_dir(&dir, "zzz", Path::new("/nonexistent"), 0).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn container_id_from_proc_cgroup() {
+        let a = "3f2a9c4e1b7d8a6f5e4c3b2a1908f7e6d5c4b3a29180f7e6d5c4b3a2918070f6";
+        let b = "0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let known = |id: &str| id == a || id == b;
+        assert_eq!(container_id(&format!("0::/system.slice/docker-{a}.scope\n"), known), Some(a));
+        assert_eq!(container_id(&format!("0::/../docker-{a}.scope\n"), known), Some(a));
+        assert_eq!(container_id(&format!("0::/docker/{b}/init.scope\n"), known), Some(b));
+        assert_eq!(container_id(&format!("12:memory:/docker/{b}\n0::/docker/{b}\n"), known), Some(b));
+        // Nested: the outer container is the one Docker knows.
+        assert_eq!(container_id(&format!("0::/docker/{a}/docker/{}\n", "f".repeat(64)), known), Some(a));
+        assert_eq!(container_id("0::/user.slice/user-1000.slice/session-3.scope\n", known), None);
+        assert_eq!(container_id(&format!("0::/system.slice/docker-{}.scope\n", "e".repeat(64)), known), None);
     }
 }

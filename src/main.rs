@@ -9,7 +9,8 @@ mod remote_write;
 mod state;
 mod util;
 
-use config::Config;
+use config::{Config, Toggle};
+use host::gpu;
 use metrics::MetricSet;
 use state::{Shared, Snapshot};
 use std::sync::atomic::Ordering;
@@ -65,8 +66,16 @@ fn main() {
     if cfg.containers.enabled || cfg.logs.enabled {
         registry.start(&cfg);
     }
-    let mut host = cfg.host_metrics.enabled.then(|| host::HostCollector::new(&cfg));
-    let mut ctrs = cfg.containers.enabled.then(|| containers::ContainerCollector::new(&cfg, registry.clone()));
+    let gpu = (cfg.gpu.enabled != Toggle::Off && (cfg.host_metrics.enabled || cfg.containers.enabled)).then(|| {
+        let per_process = match (cfg.containers.enabled, gpu::host_pid_namespace(&cfg.paths.proc)) {
+            (false, _) => gpu::PerProcess::Off,
+            (true, false) => gpu::PerProcess::NoHostPid,
+            (true, true) => gpu::PerProcess::On,
+        };
+        gpu::Watcher::start(&cfg.gpu.nvidia_smi, cfg.interval, cfg.gpu.enabled == Toggle::Auto, per_process)
+    });
+    let mut host = cfg.host_metrics.enabled.then(|| host::HostCollector::new(&cfg, gpu.clone()));
+    let mut ctrs = cfg.containers.enabled.then(|| containers::ContainerCollector::new(&cfg, registry.clone(), gpu));
     let shared = Shared::default();
 
     if once {

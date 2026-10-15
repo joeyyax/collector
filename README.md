@@ -2,7 +2,7 @@
 
 Watch a Docker host's CPU, memory, disks, network, GPUs, containers and logs with one small binary instead of four agents.
 
-A typical Docker host runs node_exporter for host metrics, cAdvisor for container metrics, a GPU exporter and a log shipper such as Alloy or Promtail. Each is a separate process with its own polling, and cAdvisor alone can use a full CPU core on a busy host. The collector reads the same numbers straight from `/proc`, `/sys` and cgroup v2 files on a timer, asks Docker only for the container list and its events, and runs one `nvidia-smi` process for GPU readings. It serves everything as Prometheus metrics, the text format most monitoring tools scrape, and ships container logs to VictoriaLogs, a log database, or to a local file.
+A typical Docker host runs node_exporter for host metrics, cAdvisor for container metrics, a GPU exporter and a log shipper such as Alloy or Promtail. Each is a separate process with its own polling, and cAdvisor alone can use a full CPU core on a busy host. The collector reads the same numbers straight from `/proc`, `/sys` and cgroup v2 files on a timer, asks Docker only for the container list and its events, and keeps `nvidia-smi` running for GPU readings. It serves everything as Prometheus metrics, the text format most monitoring tools scrape, and ships container logs to VictoriaLogs, a log database, or to a local file.
 
 Metric names match node_exporter, cAdvisor and the NVIDIA GPU exporter, so existing dashboards and alerts keep working. [docs/metrics.md](docs/metrics.md) lists what matches and what's missing.
 
@@ -52,6 +52,8 @@ volumes:
 | `/var/lib/docker/containers` | Container log files |
 
 GPU hosts need the NVIDIA runtime so `nvidia-smi` is injected: `runtime: nvidia` with `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=utility`. The image uses a glibc distroless base for this; the binary itself is static.
+
+Per-container GPU memory also needs `pid: host`. `nvidia-smi` lists only the processes in its own PID namespace, so without it every container reports no GPU use and the collector logs why at startup.
 
 Without Docker: `collector --config collector.toml` with the default paths (`/proc`, `/sys`, `/`).
 

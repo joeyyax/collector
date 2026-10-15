@@ -2,13 +2,13 @@ pub mod cgroup;
 pub mod docker;
 
 use crate::config::Config;
-use crate::host::{emit_net, procfs};
+use crate::host::{emit_net, gpu, procfs};
 use crate::metrics::{sanitize_label_name, Kind, LabelSet, MetricSet};
 use crate::util::{self, log, rate, read};
 use docker::Docker;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, RwLock};
@@ -254,6 +254,7 @@ pub struct ContainerSnapshot {
     pub io: Vec<IoOut>,
     pub network: Vec<NetOut>,
     pub pids: PidsOut,
+    pub gpus: Vec<GpuOut>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -300,6 +301,12 @@ pub struct PidsOut {
     pub limit: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct GpuOut {
+    pub uuid: String,
+    pub memory_used_bytes: u64,
+}
+
 struct Prev {
     at: f64,
     usage_usec: u64,
@@ -313,18 +320,24 @@ pub struct ContainerCollector {
     network: bool,
     prev: HashMap<String, Prev>,
     devices: HashMap<(u32, u32), String>,
+    gpu: Option<gpu::Watcher>,
 }
 
 impl ContainerCollector {
-    pub fn new(cfg: &Config, registry: Registry) -> Self {
-        Self { registry, proc: cfg.paths.proc.clone(), sys: cfg.paths.sys.clone(), network: cfg.containers.network, prev: HashMap::new(), devices: HashMap::new() }
+    pub fn new(cfg: &Config, registry: Registry, gpu: Option<gpu::Watcher>) -> Self {
+        Self { registry, proc: cfg.paths.proc.clone(), sys: cfg.paths.sys.clone(), network: cfg.containers.network, prev: HashMap::new(), devices: HashMap::new(), gpu }
     }
 
     pub fn collect(&mut self, m: &mut MetricSet) -> Vec<ContainerSnapshot> {
         let now = util::now_secs();
         let mut out = Vec::new();
         let mut next_prev = HashMap::new();
-        for c in self.registry.all() {
+        let ctrs = self.registry.all();
+        let mut gpu_mem = match &self.gpu {
+            Some(w) => gpu_by_container(&self.proc, &w.apps(), &ctrs.iter().map(|c| c.id.as_str()).collect()),
+            None => HashMap::new(),
+        };
+        for c in &ctrs {
             let Some(dir) = &c.cgroup else { continue };
             let Some(raw) = cgroup::read_cgroup(dir) else { continue };
             let prev = self.prev.remove(&c.id);
@@ -417,8 +430,13 @@ impl ContainerCollector {
                 }
             }
 
+            let gpus: Vec<GpuOut> = gpu_mem.remove(&c.id).unwrap_or_default().into_iter().map(|(uuid, memory_used_bytes)| GpuOut { uuid, memory_used_bytes }).collect();
+            for g in &gpus {
+                m.push_with("container_accelerator_memory_used_bytes", "Total accelerator memory allocated.", Kind::Gauge, l, &[("uuid", &g.uuid)], g.memory_used_bytes as f64);
+            }
+
             next_prev.insert(c.id.clone(), Prev { at: now, usage_usec: raw.cpu.usage_usec, net: net_prev });
-            out.push(ContainerSnapshot { meta: c.clone(), cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max } });
+            out.push(ContainerSnapshot { meta: c.clone(), cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max }, gpus });
         }
         self.prev = next_prev;
         out
@@ -432,6 +450,17 @@ impl ContainerCollector {
         self.devices.insert((major, minor), name.clone());
         name
     }
+}
+
+/// GPU memory by container id and GPU uuid, summed over each container's processes. `proc` must be the PID namespace nvidia-smi reports in.
+pub fn gpu_by_container(proc: &Path, apps: &[gpu::App], ids: &HashSet<&str>) -> HashMap<String, BTreeMap<String, u64>> {
+    let mut out: HashMap<String, BTreeMap<String, u64>> = HashMap::new();
+    for a in apps {
+        let Some(text) = read(proc.join(format!("{}/cgroup", a.pid))) else { continue };
+        let Some(id) = cgroup::container_id(&text, |id| ids.contains(id)) else { continue };
+        *out.entry(id.to_string()).or_default().entry(a.uuid.clone()).or_default() += a.memory_used_bytes;
+    }
+    out
 }
 
 fn put(m: &mut MetricSet, name: &str, help: &'static str, kind: Kind, labels: &LabelSet, v: f64) {
@@ -514,5 +543,28 @@ mod tests {
         assert_eq!(rfc3339_nanos("2026-10-10T12:00:00.123456789Z"), Some(1_791_633_600_123_456_789));
         assert_eq!(rfc3339_nanos("2026-10-10T12:00:00.5Z"), Some(1_791_633_600_500_000_000));
         assert_eq!(rfc3339_nanos("2026-10-10T12:00:00Z"), Some(1_791_633_600_000_000_000));
+    }
+
+    #[test]
+    fn maps_gpu_processes_to_containers() {
+        let (web, shop) = ("a".repeat(64), "b".repeat(64));
+        let proc = std::env::temp_dir().join(format!("collector-gpu-{}", std::process::id()));
+        for (pid, cg) in [
+            (100, format!("0::/system.slice/docker-{web}.scope")),
+            (101, format!("0::/system.slice/docker-{web}.scope")),
+            (200, format!("0::/../docker-{shop}.scope")),
+            (300, "0::/user.slice/user-1000.slice/session-3.scope".to_string()),
+        ] {
+            std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+            std::fs::write(proc.join(format!("{pid}/cgroup")), format!("{cg}\n")).unwrap();
+        }
+        let csv = "100, GPU-1111, 1000\n101, GPU-1111, 24\n101, GPU-2222, 300\n200, GPU-2222, 512\n300, GPU-1111, 64\n404, GPU-1111, 8\n";
+        let apps: Vec<gpu::App> = csv.lines().filter_map(gpu::parse_app).collect();
+        let ids: HashSet<&str> = [web.as_str(), shop.as_str()].into();
+        let got = gpu_by_container(&proc, &apps, &ids);
+        let _ = std::fs::remove_dir_all(&proc);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[&web], BTreeMap::from([("1111".to_string(), 1024 << 20), ("2222".to_string(), 300 << 20)]));
+        assert_eq!(got[&shop], BTreeMap::from([("2222".to_string(), 512 << 20)]));
     }
 }

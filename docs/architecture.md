@@ -16,7 +16,7 @@ One process, plain OS threads, no async runtime. Each thread owns one job and sh
    └─────┬──────┘  └─────────────┘
          │ Snapshot { host, containers, MetricSet }
    ┌─────▼──────────────┐   ┌──────────────┐   ┌─────┐
-   │ http-0..3 workers  │   │ remote-write │   │ gpu │  one nvidia-smi --loop-ms child
+   │ http-0..3 workers  │   │ remote-write │   │ gpu │  nvidia-smi --loop-ms children: GPUs, GPU processes
    │ /metrics /api/v1/* │   │ bounded queue│   └─────┘
    └────────────────────┘   └──────────────┘
    main thread: sigwait(SIGTERM) → flush logs and queue → exit
@@ -32,11 +32,11 @@ One process, plain OS threads, no async runtime. Each thread owns one job and sh
 | `src/host/procfs.rs` | Pure parsers for `/proc/stat`, `loadavg`, `meminfo`, `diskstats`, `net/dev`, mounts |
 | `src/host/deadline.rs` | Runs `statfs` calls on threads with a deadline; skips keys still stuck from an earlier round |
 | `src/host/hwmon.rs` | hwmon sensors with node_exporter's chip naming |
-| `src/host/gpu.rs` | `nvidia-smi` CSV parser and the long-running watcher |
+| `src/host/gpu.rs` | `nvidia-smi` CSV parsers and the long-running GPU and GPU-process watchers |
 | `src/host/mod.rs` | Host collection, rates, node_exporter metric names |
 | `src/containers/docker.rs` | Minimal HTTP/1.1 client over the Unix socket (chunked decoding, events stream) |
-| `src/containers/cgroup.rs` | Pure parsers for cgroup v2 files and cgroup dir discovery |
-| `src/containers/mod.rs` | Registry, container collection, cAdvisor metric names |
+| `src/containers/cgroup.rs` | Pure parsers for cgroup v2 files, cgroup dir discovery and container ids in `/proc/<pid>/cgroup` |
+| `src/containers/mod.rs` | Registry, container collection, GPU processes mapped to containers, cAdvisor metric names |
 | `src/logs/cursor.rs` | Rotation-aware reader over `<id>-json.log`, `.1`, `.2` …, with per-line positions; cursor state file |
 | `src/logs/assemble.rs` | Joins 16 KB partial pieces and groups multi-line records; reports the oldest held-back position |
 | `src/logs/mod.rs` | Follow set, logs API followers, batching, retry, commit and replay, shutdown flush |

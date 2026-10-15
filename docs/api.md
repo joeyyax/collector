@@ -86,7 +86,8 @@ An array of the objects below, sorted by name.
   "io": [{"device": "/dev/sda", "read_bytes_total": 18513920, "write_bytes_total": 0}],
   "network": [{"interface": "eth0", "receive_bytes_total": 311769077, "transmit_bytes_total": 1519029101,
                "receive_bytes_per_second": 14723.5, "transmit_bytes_per_second": 4361.8}],
-  "pids": {"current": 9, "limit": 76881}
+  "pids": {"current": 9, "limit": 76881},
+  "gpus": [{"uuid": "00000000-0000-0000-0000-000000000000", "memory_used_bytes": 1658847232}]
 }
 ```
 
@@ -94,3 +95,4 @@ An array of the objects below, sorted by name.
 - `cpu.usage_cores` is cores in use: 1.0 is one full core. `limit_cores` comes from `cpu.max`; `null` means unlimited.
 - `memory.limit_bytes` and `pids.limit` are `null` when unlimited. `peak_bytes` is `null` on kernels before 5.19.
 - `network` is empty for `network_mode: host` containers.
+- `gpus` has one entry per GPU the container's processes hold memory on, summed over its processes. It's empty for containers with no GPU processes, without GPUs and when the collector doesn't run with `pid: host`. `uuid` matches `gpus[].uuid` in `/api/v1/host`.

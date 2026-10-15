@@ -66,6 +66,7 @@ Logs get the same kept labels as fields. VictoriaLogs only indexes `stream_field
 | `container_spec_pids_limit` | `pids.max` | Not in cAdvisor |
 | `container_start_time_seconds` | Docker `State.StartedAt` | Matches cAdvisor; cAdvisor rounds to whole seconds |
 | `container_last_seen` | | |
+| `container_accelerator_memory_used_bytes` | `nvidia-smi --query-compute-apps` | `uuid` label. One series per GPU the container's processes hold memory on; none for containers without GPU processes. Needs `pid: host` |
 
 Differences from cAdvisor:
 
@@ -73,6 +74,7 @@ Differences from cAdvisor:
 - **`id` label.** The cgroup path relative to the cgroup root (`/system.slice/docker-<id>.scope`), same as cAdvisor.
 - **Host-network containers** get no `container_network_*` series. cAdvisor reports the host's interfaces for them, which double-counts host traffic.
 - **Not collected:** `container_fs_usage_bytes` and the other writable-layer size metrics (they need a filesystem walk; this is cAdvisor's most expensive work), `container_fs_inodes_*`, `container_cpu_load_average_10s`, `container_tasks_state`, `container_memory_failures_total`, `container_memory_failcnt`, `container_pressure_*`, `container_spec_cpu_shares`, `container_spec_memory_reservation_limit_bytes`, `container_spec_memory_swap_limit_bytes`, `container_health_state`, `container_creation_time_seconds`, `container_blkio_device_usage_total`.
+- **GPU memory.** `container_accelerator_memory_used_bytes` sums the memory of the container's own processes. cAdvisor reported the whole GPU's memory for every container the GPU was attached to, with `make`, `model` and `acc_id` labels. Here the label is `uuid`, so it joins with `nvidia_smi_*`. The other `container_accelerator_*` metrics aren't collected.
 - **Timestamps.** cAdvisor attaches its own sample timestamps; the collector doesn't, so scrapes use scrape time.
 
 ## GPU (nvidia_gpu_exporter)
@@ -88,11 +90,13 @@ Differences from cAdvisor:
 
 `uuid` drops the `GPU-` prefix, as the exporter does. `nvidia_smi_gpu_info` has fewer labels than the exporter's (no driver or VBIOS version).
 
+Readings come from `nvidia-smi --query-gpu --loop-ms=<interval>`. Once it reports a GPU and container metrics are on, a second `nvidia-smi --query-compute-apps` loop reads per-process GPU memory for `container_accelerator_memory_used_bytes`. Each process's container comes from `/proc/<pid>/cgroup`. With `gpu.enabled = "off"`, a build without the `gpu` feature or no `nvidia-smi`, neither runs.
+
 ## The collector's own
 
 | Metric | Meaning |
 |---|---|
-| `process_cpu_seconds_total`, `process_resident_memory_bytes` | Collector process only (not the `nvidia-smi` child) |
+| `process_cpu_seconds_total`, `process_resident_memory_bytes` | Collector process only (not the `nvidia-smi` children) |
 | `collector_filesystems_hung` | Mounts whose `statfs` hasn't returned |
 | `collector_log_containers_followed_api`, `collector_log_containers_unsupported` | Containers on `local`/`journald` (read through the API) and on drivers that can't be read |
 | `collector_remote_write_dropped_samples_total`, `collector_remote_write_queue_pushes`, `collector_remote_write_queue_bytes` | Remote-write retry queue |
