@@ -160,6 +160,14 @@ impl Watcher {
         }
     }
 
+    #[cfg(test)]
+    pub fn with_apps(interval: Duration, apps: Vec<App>) -> Self {
+        let w = Self { latest: Arc::default(), apps: Arc::default(), interval };
+        let now = Instant::now();
+        apps.into_iter().for_each(|a| w.apps.lock().unwrap().feed(a, now, interval));
+        w
+    }
+
     /// GPU processes from the newest round; empty when no process has a GPU context.
     pub fn apps(&self) -> Vec<App> {
         self.apps.lock().unwrap().current(Instant::now(), self.interval * 3 / 2)

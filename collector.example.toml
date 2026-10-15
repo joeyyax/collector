@@ -39,6 +39,8 @@ network = true
 # Docker labels copied onto metrics (container_label_*), logs and the API; `*` or a trailing `.` matches a prefix.
 # Each label multiplies series per container; see docs/metrics.md before adding per-deploy values.
 labels = ["com.docker.compose.project", "com.docker.compose.service"]
+# Labels copied onto logs and the API only, never metrics. Same matching as labels.
+api_labels = []
 resync = "5m"
 
 [gpu]

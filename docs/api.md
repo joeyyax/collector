@@ -93,7 +93,7 @@ An array of the objects below, sorted by name.
 }
 ```
 
-- `labels` holds only the kept labels (`containers.labels`).
+- `labels` holds the labels kept by `containers.labels` and `containers.api_labels`. Only the first list reaches `/metrics`.
 - `cpu.usage_cores` is cores in use: 1.0 is one full core. `limit_cores` comes from `cpu.max`; `null` means unlimited.
 - `memory.limit_bytes` and `pids.limit` are `null` when unlimited. `peak_bytes` is `null` on kernels before 5.19.
 - `network` is empty for `network_mode: host` containers.

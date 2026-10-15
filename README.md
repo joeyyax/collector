@@ -72,6 +72,14 @@ COLLECTOR_REMOTE_WRITE__URL=http://victoriametrics:8428/api/v1/write
 
 `COLLECTOR_CONFIG` names the file. `collector --once` prints one collection in Prometheus format and exits.
 
+Docker labels are dropped unless listed. `containers.labels` keeps them on metrics, logs and the API. `containers.api_labels` keeps them on logs and the API only, which suits per-deploy values that would multiply metric series. Both take exact keys, `*` or a trailing `.` for a prefix:
+
+```toml
+[containers]
+labels = ["com.docker.compose.project", "com.docker.compose.service"]
+api_labels = ["com.example."]
+```
+
 ## HTTP API
 
 The binary listens on `127.0.0.1:9273` by default (`listen`). The image sets `0.0.0.0:9273` because loopback inside a container is unreachable; publish the port on `127.0.0.1` or a private address.
@@ -105,7 +113,7 @@ With `api.token` or `api.token_file` set, requests need `Authorization: Bearer <
 - **Shutdown.** SIGTERM stops reading, sends pending multi-line groups, waits up to `shutdown_timeout` (10 s) for the last batch and saves cursors. Give the container a longer stop timeout than that (`stop_grace_period: 20s`).
 - **Skipped**: containers labeled `collector.logs=false` (`logs.exclude_label`), names matching `logs.exclude_names` and the collector itself.
 - **First run**: existing history is skipped (`logs.first_run = "end"`). Containers that start later are read from the beginning.
-- **Fields**: `_time`, `_msg`, `stream`, `host`, `container`, `container_id`, `image`, `compose_project`, `compose_service`, the kept labels and `level` when the line is JSON with a recognizable level. Stream fields default to `host`, `container`, `compose_project`, `compose_service`.
+- **Fields**: `_time`, `_msg`, `stream`, `host`, `container`, `container_id`, `image`, `compose_project`, `compose_service`, the labels kept by `containers.labels` and `containers.api_labels`, and `level` when the line is JSON with a recognizable level. Stream fields default to `host`, `container`, `compose_project`, `compose_service`.
 
 Lines lost to Docker's own rotation, when a file rotates out of `max-file` before it's read, are counted in `collector_log_rotations_missed_total`.
 

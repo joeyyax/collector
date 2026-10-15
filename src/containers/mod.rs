@@ -1,7 +1,7 @@
 pub mod cgroup;
 pub mod docker;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::host::{emit_net, gpu, procfs};
 use crate::metrics::{sanitize_label_name, Kind, LabelSet, MetricSet};
 use crate::util::{self, log, rate, read};
@@ -24,7 +24,7 @@ pub struct Container {
     pub network_mode: String,
     pub started_at: String,
     pub created: String,
-    /// Every Docker label, for filters; `labels` holds the kept subset.
+    /// Every Docker label, for filters; `labels` holds those kept by `containers.labels` or `containers.api_labels`.
     #[serde(skip)]
     pub all_labels: BTreeMap<String, String>,
     #[serde(skip)]
@@ -86,7 +86,7 @@ impl Registry {
         let me = self.clone();
         let cgroot = cfg.paths.sys.join("fs/cgroup");
         let proc = cfg.paths.proc.clone();
-        let prefixes = cfg.containers.labels.clone();
+        let rules = cfg.containers.clone();
         let resync = cfg.containers.resync;
         std::thread::Builder::new()
             .name("registry".into())
@@ -96,9 +96,9 @@ impl Registry {
                 let mut full = true;
                 loop {
                     if full {
-                        me.sync(&docker, &cgroot, &proc, &prefixes, &stale);
+                        me.sync(&docker, &cgroot, &proc, &rules, &stale);
                     } else {
-                        me.update(&docker, &cgroot, &proc, &prefixes, &stale);
+                        me.update(&docker, &cgroot, &proc, &rules, &stale);
                     }
                     stale.clear();
                     full = false;
@@ -121,7 +121,7 @@ impl Registry {
             .expect("spawn registry");
     }
 
-    fn sync(&self, docker: &Docker, cgroot: &std::path::Path, proc: &std::path::Path, prefixes: &[String], stale: &[String]) {
+    fn sync(&self, docker: &Docker, cgroot: &Path, proc: &Path, rules: &config::Containers, stale: &[String]) {
         let list = match docker.list() {
             Ok(l) => {
                 self.docker_ok.store(true, Ordering::Relaxed);
@@ -144,7 +144,7 @@ impl Registry {
             }
             match docker.inspect(&s.id) {
                 Ok(i) => {
-                    let c = build(i, cgroot, proc, prefixes);
+                    let c = build(i, cgroot, proc, rules);
                     next.insert(c.id.clone(), Arc::new(c));
                 }
                 Err(e) => log::debug!("{e}"),
@@ -158,12 +158,12 @@ impl Registry {
 
 impl Registry {
     /// Re-inspects only the containers an event named, dropping any that are gone or no longer running.
-    fn update(&self, docker: &Docker, cgroot: &std::path::Path, proc: &std::path::Path, prefixes: &[String], ids: &[String]) {
+    fn update(&self, docker: &Docker, cgroot: &Path, proc: &Path, rules: &config::Containers, ids: &[String]) {
         let mut next = self.inner.read().unwrap().clone();
         for id in ids {
             match docker.inspect(id) {
                 Ok(i) if counts(&i.state) => {
-                    let c = build(i, cgroot, proc, prefixes);
+                    let c = build(i, cgroot, proc, rules);
                     next.insert(c.id.clone(), Arc::new(c));
                 }
                 _ => {
@@ -205,9 +205,10 @@ fn spawn_events(docker: Docker, tx: Sender<Option<String>>) {
         .expect("spawn docker-events");
 }
 
-fn build(i: docker::Inspect, cgroot: &std::path::Path, proc: &std::path::Path, prefixes: &[String]) -> Container {
+fn build(i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &config::Containers) -> Container {
     let all_labels = i.config.labels.unwrap_or_default();
-    let labels: BTreeMap<String, String> = all_labels.iter().filter(|(k, _)| keep_label(prefixes, k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let labels: BTreeMap<String, String> =
+        all_labels.iter().filter(|(k, _)| keep_label(&rules.labels, k) || keep_label(&rules.api_labels, k)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let name = i.name.trim_start_matches('/').to_string();
     let cgroup = cgroup::find_dir(cgroot, &i.id, proc, i.state.pid);
     let id_label = cgroup
@@ -216,7 +217,7 @@ fn build(i: docker::Inspect, cgroot: &std::path::Path, proc: &std::path::Path, p
         .map(|p| format!("/{}", p.display()))
         .unwrap_or_else(|| format!("/docker/{}", i.id));
     let mut metric_labels = vec![("id".to_string(), id_label), ("image".to_string(), i.config.image.clone()), ("name".to_string(), name.clone())];
-    for (k, v) in &labels {
+    for (k, v) in labels.iter().filter(|(k, _)| keep_label(&rules.labels, k)) {
         metric_labels.push((format!("container_label_{}", sanitize_label_name(k)), v.clone()));
     }
     Container {
@@ -566,5 +567,40 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[&web], BTreeMap::from([("1111".to_string(), 1024 << 20), ("2222".to_string(), 300 << 20)]));
         assert_eq!(got[&shop], BTreeMap::from([("2222".to_string(), 512 << 20)]));
+    }
+
+    #[test]
+    fn api_labels_stay_out_of_metrics() {
+        let id = "c".repeat(64);
+        let root = std::env::temp_dir().join(format!("collector-labels-{}", std::process::id()));
+        let cg = root.join(format!("sys/fs/cgroup/system.slice/docker-{id}.scope"));
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(cg.join("cpu.stat"), "usage_usec 1000\n").unwrap();
+        std::fs::create_dir_all(root.join("proc/4242")).unwrap();
+        std::fs::write(root.join("proc/4242/cgroup"), format!("0::/system.slice/docker-{id}.scope\n")).unwrap();
+        let mut cfg = Config::default();
+        cfg.paths.sys = root.join("sys");
+        cfg.paths.proc = root.join("proc");
+        cfg.containers.labels = vec!["com.docker.compose.project".into()];
+        cfg.containers.api_labels = vec!["com.example.".into()];
+        let inspect: docker::Inspect = serde_json::from_value(serde_json::json!({
+            "Id": id, "Name": "/shop-web", "State": {"Running": true, "Pid": 0},
+            "Config": {"Image": "shop/web:1", "Labels": {"com.docker.compose.project": "shop", "com.example.owner": "web-team", "com.example.deploy-id": "d-123", "org.example.other": "x"}}
+        }))
+        .unwrap();
+        let c = build(inspect, &cfg.paths.sys.join("fs/cgroup"), &cfg.paths.proc, &cfg.containers);
+        let registry = Registry::new();
+        registry.inner.write().unwrap().insert(c.id.clone(), Arc::new(c));
+        let gpu = gpu::Watcher::with_apps(cfg.interval, vec![gpu::App { pid: 4242, uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
+        let mut m = MetricSet::new();
+        let snaps = ContainerCollector::new(&cfg, registry, Some(gpu)).collect(&mut m);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let text = m.render(&[]);
+        assert!(text.contains(r#"container_label_com_docker_compose_project="shop""#));
+        assert!(!text.contains("com_example") && !text.contains("web-team") && !text.contains("d-123"));
+        assert!(text.lines().any(|l| l.starts_with("container_accelerator_memory_used_bytes{") && l.ends_with(r#",uuid="1111"} 1048576"#)));
+        assert_eq!(snaps[0].meta.labels.keys().collect::<Vec<_>>(), ["com.docker.compose.project", "com.example.deploy-id", "com.example.owner"]);
+        assert_eq!(snaps[0].gpus, vec![GpuOut { uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
     }
 }

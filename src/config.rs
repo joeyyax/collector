@@ -73,8 +73,10 @@ pub struct HostMetrics {
 pub struct Containers {
     pub enabled: bool,
     pub network: bool,
-    /// Docker labels to keep; a trailing `.` or `*` makes it a prefix.
+    /// Docker labels kept on metrics, logs and the API; a trailing `.` or `*` makes it a prefix.
     pub labels: Vec<String>,
+    /// Labels kept on logs and the API only, never on metrics; same matching as `labels`.
+    pub api_labels: Vec<String>,
     #[serde(with = "dur")]
     pub resync: Duration,
 }
@@ -240,6 +242,7 @@ impl Default for Containers {
                 "com.docker.compose.project".into(),
                 "com.docker.compose.service".into(),
             ],
+            api_labels: Vec::new(),
             resync: Duration::from_secs(300),
         }
     }

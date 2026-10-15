@@ -45,7 +45,14 @@ To opt back in, list the labels or a prefix:
 labels = ["com.docker.compose.project", "com.docker.compose.service", "com.example.*"]
 ```
 
-Logs get the same kept labels as fields. VictoriaLogs only indexes `stream_fields` as streams, so extra fields there cost storage, not stream cardinality.
+Labels a consumer needs per container but no query groups by, such as a deployment id or an owner, belong in `containers.api_labels`. It takes the same patterns and adds labels to the JSON API and log fields but never to `/metrics` or remote write:
+
+```toml
+[containers]
+api_labels = ["com.example.deploy-id", "com.example.owner"]
+```
+
+Logs get the labels from both lists as fields. VictoriaLogs only indexes `stream_fields` as streams, so extra fields there cost storage, not stream cardinality.
 
 | Metric | Source | Notes |
 |---|---|---|
