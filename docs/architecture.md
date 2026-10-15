@@ -48,7 +48,7 @@ One process, plain OS threads, no async runtime. Each thread owns one job and sh
 
 - **Collect on a timer, serve from the snapshot.** Scrapes and API calls never touch `/proc` or cgroups. `/metrics` streams the text in 16 KiB pieces, so a scrape never holds the whole exposition in memory.
 - **Docker API for metadata only.** Stats come from cgroup files, not `/containers/{id}/stats`, which costs a stream per container.
-- **Logs from files, not the API.** The json-file log on disk gives byte offsets for exact resume and doubles as the backpressure buffer. A `local` or `journald` driver isn't followed.
+- **Logs from files, not the API.** The json-file log on disk gives byte offsets for exact resume and doubles as the backpressure buffer.
 - **One batch in flight.** The log thread blocks on a failing sink rather than buffering; memory is bounded by `logs.batch_bytes`.
 - **Commit and replay.** A held-back record (a partial line or an open multi-line group) can span batches. The saved cursor points at its start and also records how far reading got (`replay_until`). After a crash the reader goes back to the start, rebuilds the held-back record and drops anything it emits before `replay_until`, since that was already delivered.
 - **Logs API only where needed.** Files give exact byte offsets and cost nothing between polls; `local` and `journald` have no readable files, so those containers get one streaming API connection each, resumed by nanosecond timestamp.
