@@ -1,3 +1,4 @@
+use crate::config::Compat;
 use crate::containers::ContainerSnapshot;
 use crate::logs::Stats as LogStats;
 use crate::metrics::{MetricSet, TextReader};
@@ -64,9 +65,14 @@ impl Api {
             let _ = req.respond(res);
             return;
         }
+        let query = parse_query(req.url());
         if path == "/metrics" {
+            let Some(mode) = Compat::parse(param(&query, "compat").unwrap_or("")) else {
+                let _ = req.respond(json(400, &Error { error: "compat must be cadvisor or none" }));
+                return;
+            };
             let gzip = req.headers().iter().any(|h| h.field.equiv("Accept-Encoding") && h.value.as_str().contains("gzip"));
-            let body = self.metrics_body();
+            let body = self.metrics_body(mode);
             let ctype = Header::from_bytes("Content-Type", "text/plain; version=0.0.4; charset=utf-8").unwrap();
             let _ = if gzip {
                 let enc = flate2::read::GzEncoder::new(body, flate2::Compression::fast());
@@ -109,11 +115,11 @@ impl Api {
     }
 
     /// Streams the last collection, then the collector's own metrics.
-    fn metrics_body(&self) -> impl Read + Send {
+    fn metrics_body(&self, mode: Compat) -> impl Read + Send {
         let set = self.shared.read().metrics.clone();
         let mut own = MetricSet::new();
         self.process_metrics(&mut own);
-        TextReader::new(set).chain(std::io::Cursor::new(own.render(&[]).into_bytes()))
+        TextReader::new(set, mode).chain(std::io::Cursor::new(own.render(&[], mode).into_bytes()))
     }
 
     fn process_metrics(&self, m: &mut MetricSet) {
@@ -194,6 +200,42 @@ fn fresh(collected_at: f64, now: f64, interval: Duration) -> bool {
 
 const STALE_SLACK: f64 = 5.0;
 
+/// Query parameters in order, percent-decoded.
+fn parse_query(url: &str) -> Vec<(String, String)> {
+    let Some((_, q)) = url.split_once('?') else { return Vec::new() };
+    q.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (decode(k), decode(v))
+        })
+        .collect()
+}
+
+fn param<'a>(q: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    q.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+fn decode(s: &str) -> String {
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+            (b'+', ..) => out.push(b' '),
+            (c, ..) => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn millis(secs: f64) -> f64 {
     (secs * 1000.0).round() / 1000.0
 }
@@ -222,6 +264,18 @@ mod tests {
         assert!(constant_eq(b"Bearer abc", b"Bearer abc"));
         assert!(!constant_eq(b"Bearer abd", b"Bearer abc"));
         assert!(!constant_eq(b"Bearer ab", b"Bearer abc"));
+    }
+
+    #[test]
+    fn parses_query_strings() {
+        let q = parse_query("/api/v1/containers?sort=net%5Frx&limit=5&x&compat=cadvisor&limit=3");
+        assert_eq!(param(&q, "sort"), Some("net_rx"));
+        assert_eq!(param(&q, "limit"), Some("3"));
+        assert_eq!(param(&q, "x"), Some(""));
+        assert_eq!(param(&q, "nope"), None);
+        assert!(parse_query("/metrics").is_empty());
+        assert_eq!(decode("a%2"), "a%2");
+        assert_eq!(decode("%e2%9c%93+%zz"), "\u{2713} %zz");
     }
 
     #[test]

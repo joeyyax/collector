@@ -3,7 +3,7 @@ pub mod docker;
 
 use crate::config::{self, Config};
 use crate::host::{emit_net, gpu, procfs};
-use crate::metrics::{sanitize_label_name, Kind, LabelSet, MetricSet};
+use crate::metrics::{sanitize_label_name, Base, Kind, LabelSet, MetricSet};
 use crate::util::{self, log, rate, read};
 use docker::Docker;
 use serde::Serialize;
@@ -19,6 +19,8 @@ pub struct Container {
     pub id: String,
     pub name: String,
     pub image: String,
+    pub compose_project: Option<String>,
+    pub compose_service: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub pid: u32,
     pub network_mode: String,
@@ -39,15 +41,15 @@ pub struct Container {
     pub metric_labels: LabelSet,
 }
 
+pub const COMPOSE_PROJECT: &str = "com.docker.compose.project";
+pub const COMPOSE_SERVICE: &str = "com.docker.compose.service";
+
 impl Container {
-    pub fn label(&self, k: &str) -> Option<&str> {
-        self.labels.get(k).map(String::as_str)
-    }
     pub fn compose_project(&self) -> Option<&str> {
-        self.all_labels.get("com.docker.compose.project").map(String::as_str)
+        self.compose_project.as_deref()
     }
     pub fn compose_service(&self) -> Option<&str> {
-        self.all_labels.get("com.docker.compose.service").map(String::as_str)
+        self.compose_service.as_deref()
     }
     pub fn short_id(&self) -> &str {
         &self.id[..self.id.len().min(12)]
@@ -205,27 +207,23 @@ fn spawn_events(docker: Docker, tx: Sender<Option<String>>) {
         .expect("spawn docker-events");
 }
 
-fn build(i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &config::Containers) -> Container {
+pub(crate) fn build(i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &config::Containers) -> Container {
     let all_labels = i.config.labels.unwrap_or_default();
     let labels: BTreeMap<String, String> =
         all_labels.iter().filter(|(k, _)| keep_label(&rules.labels, k) || keep_label(&rules.api_labels, k)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let name = i.name.trim_start_matches('/').to_string();
     let cgroup = cgroup::find_dir(cgroot, &i.id, proc, i.state.pid);
-    let id_label = cgroup
+    let cgroup_path = cgroup
         .as_ref()
         .and_then(|p| p.strip_prefix(cgroot).ok())
         .map(|p| format!("/{}", p.display()))
         .unwrap_or_else(|| format!("/docker/{}", i.id));
-    let mut metric_labels = vec![("id".to_string(), id_label), ("image".to_string(), i.config.image.clone()), ("name".to_string(), name.clone())];
-    for (k, v) in labels.iter().filter(|(k, _)| keep_label(&rules.labels, k)) {
-        metric_labels.push((format!("container_label_{}", sanitize_label_name(k)), v.clone()));
-    }
-    Container {
-        id: i.id,
+    let mut c = Container {
         name,
         image: i.config.image,
+        compose_project: all_labels.get(COMPOSE_PROJECT).cloned(),
+        compose_service: all_labels.get(COMPOSE_SERVICE).cloned(),
         labels,
-        all_labels,
         pid: i.state.pid,
         network_mode: i.host_config.network_mode,
         started_at: i.state.started_at,
@@ -234,8 +232,29 @@ fn build(i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &config::Contain
         log_driver: i.host_config.log_config.kind,
         tty: i.config.tty,
         cgroup,
-        metric_labels: metric_labels.into(),
+        id: i.id,
+        ..Default::default()
+    };
+    c.metric_labels = metric_labels(&c, &cgroup_path, &rules.labels);
+    c.all_labels = all_labels;
+    c
+}
+
+/// Identity labels: clean names, and cAdvisor's (`id` is the cgroup path).
+fn metric_labels(c: &Container, cgroup_path: &str, keep: &[String]) -> LabelSet {
+    let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+    let mut clean = vec![kv("container", &c.name), kv("container_id", c.short_id()), kv("image", &c.image)];
+    clean.extend(c.compose_project.as_deref().map(|v| kv("compose_project", v)));
+    clean.extend(c.compose_service.as_deref().map(|v| kv("compose_service", v)));
+    let mut cadvisor = vec![kv("id", cgroup_path), kv("image", &c.image), kv("name", &c.name)];
+    for (k, v) in c.labels.iter().filter(|(k, _)| keep_label(keep, k)) {
+        let l = (format!("container_label_{}", sanitize_label_name(k)), v.clone());
+        if k != COMPOSE_PROJECT && k != COMPOSE_SERVICE {
+            clean.push(l.clone());
+        }
+        cadvisor.push(l);
     }
+    Arc::new(Base { clean, cadvisor })
 }
 
 pub fn keep_label(patterns: &[String], key: &str) -> bool {
@@ -377,17 +396,17 @@ impl ContainerCollector {
             };
             put(m, "container_memory_usage_bytes", "Current memory usage in bytes, including all memory regardless of when it was accessed.", Kind::Gauge, l, raw.mem_current as f64);
             put(m, "container_memory_working_set_bytes", "Current working set in bytes.", Kind::Gauge, l, raw.working_set() as f64);
-            put(m, "container_memory_rss", "Size of RSS in bytes.", Kind::Gauge, l, raw.mem_anon as f64);
-            put(m, "container_memory_cache", "Number of bytes of page cache memory.", Kind::Gauge, l, raw.mem_file as f64);
-            put(m, "container_memory_mapped_file", "Size of memory mapped files in bytes.", Kind::Gauge, l, raw.mem_file_mapped as f64);
-            put(m, "container_memory_kernel_usage", "Size of kernel memory allocated in bytes.", Kind::Gauge, l, raw.mem_kernel as f64);
+            put(m, "container_memory_rss_bytes", "Size of RSS in bytes.", Kind::Gauge, l, raw.mem_anon as f64);
+            put(m, "container_memory_cache_bytes", "Number of bytes of page cache memory.", Kind::Gauge, l, raw.mem_file as f64);
+            put(m, "container_memory_mapped_file_bytes", "Size of memory mapped files in bytes.", Kind::Gauge, l, raw.mem_file_mapped as f64);
+            put(m, "container_memory_kernel_usage_bytes", "Size of kernel memory allocated in bytes.", Kind::Gauge, l, raw.mem_kernel as f64);
             put(m, "container_memory_total_inactive_file_bytes", "Current total inactive file in bytes.", Kind::Gauge, l, raw.mem_inactive_file as f64);
             put(m, "container_memory_total_active_file_bytes", "Current total active file in bytes.", Kind::Gauge, l, raw.mem_active_file as f64);
             if let Some(p) = raw.mem_peak {
                 put(m, "container_memory_max_usage_bytes", "Maximum memory usage recorded in bytes.", Kind::Gauge, l, p as f64);
             }
             if let Some(s) = raw.mem_swap {
-                put(m, "container_memory_swap", "Container swap usage in bytes.", Kind::Gauge, l, s as f64);
+                put(m, "container_memory_swap_bytes", "Container swap usage in bytes.", Kind::Gauge, l, s as f64);
             }
             put(m, "container_spec_memory_limit_bytes", "Memory limit for the container.", Kind::Gauge, l, raw.mem_max.unwrap_or(0) as f64);
             put(m, "container_oom_events_total", "Count of out of memory events observed for the container.", Kind::Counter, l, raw.oom_kills as f64);
@@ -433,7 +452,7 @@ impl ContainerCollector {
 
             let gpus: Vec<GpuOut> = gpu_mem.remove(&c.id).unwrap_or_default().into_iter().map(|(uuid, memory_used_bytes)| GpuOut { uuid, memory_used_bytes }).collect();
             for g in &gpus {
-                m.push_with("container_accelerator_memory_used_bytes", "Total accelerator memory allocated.", Kind::Gauge, l, &[("uuid", &g.uuid)], g.memory_used_bytes as f64);
+                m.push_with("container_gpu_memory_used_bytes", "GPU memory held by the container's processes.", Kind::Gauge, l, &[("uuid", &g.uuid)], g.memory_used_bytes as f64);
             }
 
             next_prev.insert(c.id.clone(), Prev { at: now, usage_usec: raw.cpu.usage_usec, net: net_prev });
@@ -596,10 +615,16 @@ mod tests {
         let snaps = ContainerCollector::new(&cfg, registry, Some(gpu)).collect(&mut m);
         let _ = std::fs::remove_dir_all(&root);
 
-        let text = m.render(&[]);
-        assert!(text.contains(r#"container_label_com_docker_compose_project="shop""#));
+        let text = m.render(&[], config::Compat::None);
+        assert!(text.contains(r#"{container="shop-web",container_id="cccccccccccc",image="shop/web:1",compose_project="shop"}"#));
+        assert!(!text.contains("container_label_com_docker_compose_project"));
         assert!(!text.contains("com_example") && !text.contains("web-team") && !text.contains("d-123"));
-        assert!(text.lines().any(|l| l.starts_with("container_accelerator_memory_used_bytes{") && l.ends_with(r#",uuid="1111"} 1048576"#)));
+        assert!(text.lines().any(|l| l.starts_with("container_gpu_memory_used_bytes{") && l.ends_with(r#",uuid="1111"} 1048576"#)));
+        let old = m.render(&[], config::Compat::Cadvisor);
+        let id = format!("/system.slice/docker-{id}.scope");
+        assert!(old.contains(&format!(r#"container_cpu_usage_seconds_total{{id="{id}",image="shop/web:1",name="shop-web",container_label_com_docker_compose_project="shop",cpu="total"}} 0.001"#)));
+        assert!(old.contains("container_gpu_memory_used_bytes{") && !old.contains("accelerator"));
+        assert!(!old.contains("com_example") && !old.contains("container_id="));
         assert_eq!(snaps[0].meta.labels.keys().collect::<Vec<_>>(), ["com.docker.compose.project", "com.example.deploy-id", "com.example.owner"]);
         assert_eq!(snaps[0].gpus, vec![GpuOut { uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
     }

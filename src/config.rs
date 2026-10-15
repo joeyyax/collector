@@ -20,6 +20,7 @@ pub struct Config {
     pub logs: Logs,
     pub remote_write: RemoteWrite,
     pub api: Api,
+    pub metrics: Metrics,
     /// How long a SIGTERM waits for in-flight log batches and queued remote-write pushes.
     #[serde(with = "dur")]
     pub shutdown_timeout: Duration,
@@ -39,6 +40,32 @@ pub struct Api {
 impl Default for Api {
     fn default() -> Self {
         Self { token: String::new(), token_file: PathBuf::new(), workers: 4 }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Metrics {
+    /// Names and labels for remote write; scrapes choose with `?compat=`.
+    pub compat: Compat,
+}
+
+/// Metric naming: clean names, or cAdvisor's names and labels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compat {
+    #[default]
+    None,
+    Cadvisor,
+}
+
+impl Compat {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "" | "none" => Some(Compat::None),
+            "cadvisor" => Some(Compat::Cadvisor),
+            _ => None,
+        }
     }
 }
 
@@ -200,6 +227,7 @@ impl Default for Config {
             logs: Logs::default(),
             remote_write: RemoteWrite::default(),
             api: Api::default(),
+            metrics: Metrics::default(),
             shutdown_timeout: Duration::from_secs(10),
         }
     }

@@ -84,7 +84,7 @@ fn main() {
             std::thread::sleep(Duration::from_millis(50));
         }
         let s = collect(host.as_mut(), ctrs.as_mut());
-        print!("{}", s.metrics.render(&[]));
+        print!("{}", s.metrics.render(&[], config::Compat::None));
         return;
     }
 
@@ -118,8 +118,8 @@ fn main() {
 
     let remote = !cfg.remote_write.url.is_empty();
     if remote {
-        let (shared, rw, timeout) = (shared.clone(), cfg.remote_write.clone(), cfg.shutdown_timeout);
-        std::thread::Builder::new().name("remote-write".into()).spawn(move || remote_write::run(rw, shared, timeout)).expect("spawn remote-write");
+        let (shared, rw, mode, timeout) = (shared.clone(), cfg.remote_write.clone(), cfg.metrics.compat, cfg.shutdown_timeout);
+        std::thread::Builder::new().name("remote-write".into()).spawn(move || remote_write::run(rw, mode, shared, timeout)).expect("spawn remote-write");
     }
 
     log::info!(

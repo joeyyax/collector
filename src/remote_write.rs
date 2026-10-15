@@ -1,5 +1,5 @@
-use crate::config::RemoteWrite;
-use crate::metrics::MetricSet;
+use crate::config::{Compat, RemoteWrite};
+use crate::metrics::{family_name, MetricSet};
 use crate::state::Shared;
 use crate::util::{self, log, shutdown};
 use std::collections::VecDeque;
@@ -7,15 +7,15 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Encodes a Prometheus remote-write WriteRequest (protobuf), one sample per series.
-pub fn encode(m: &MetricSet, extra: &[(String, String)], ts_ms: i64) -> Vec<u8> {
+pub fn encode(m: &MetricSet, extra: &[(String, String)], ts_ms: i64, mode: Compat) -> Vec<u8> {
     let mut out = Vec::with_capacity(m.len() * 128);
     let mut series = Vec::with_capacity(256);
     let mut labels: Vec<(&str, &str)> = Vec::with_capacity(16);
     for f in &m.families {
         for s in &f.samples {
             labels.clear();
-            labels.push(("__name__", &f.name));
-            for (k, v) in extra.iter().chain(s.all_labels()) {
+            labels.push(("__name__", family_name(&f.name, mode)));
+            for (k, v) in extra.iter().chain(s.all_labels(mode)) {
                 if !labels.iter().any(|(lk, _)| *lk == k) {
                     labels.push((k, v));
                 }
@@ -59,11 +59,13 @@ pub struct Client {
     url: String,
     labels: Vec<(String, String)>,
     headers: Vec<(String, String)>,
+    mode: Compat,
 }
 
 impl Client {
-    pub fn new(cfg: &RemoteWrite) -> Self {
+    pub fn new(cfg: &RemoteWrite, mode: Compat) -> Self {
         Self {
+            mode,
             agent: ureq::AgentBuilder::new().timeout(cfg.timeout).build(),
             url: cfg.url.clone(),
             labels: cfg.labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -73,7 +75,7 @@ impl Client {
 
     /// Encodes one WriteRequest, snappy-compressed as the protocol requires.
     pub fn encode(&self, m: &MetricSet, ts_ms: i64) -> Result<Vec<u8>, String> {
-        snap::raw::Encoder::new().compress_vec(&encode(m, &self.labels, ts_ms)).map_err(|e| e.to_string())
+        snap::raw::Encoder::new().compress_vec(&encode(m, &self.labels, ts_ms, self.mode)).map_err(|e| e.to_string())
     }
 
     pub fn send(&self, body: &[u8]) -> Result<(), String> {
@@ -144,8 +146,8 @@ impl Queue {
 }
 
 /// Encodes each new collection into the queue and sends from its head with backoff; on shutdown, drains until the deadline.
-pub fn run(cfg: RemoteWrite, shared: Shared, shutdown_timeout: Duration) {
-    let client = Client::new(&cfg);
+pub fn run(cfg: RemoteWrite, mode: Compat, shared: Shared, shutdown_timeout: Duration) {
+    let client = Client::new(&cfg, mode);
     let mut queue = Queue::new(cfg.queue_bytes);
     let stats = shared.remote.clone();
     let mut last = 0.0;
@@ -244,7 +246,7 @@ mod tests {
     fn encodes_one_series() {
         let mut m = MetricSet::new();
         m.gauge("up", "Up.", &[("job", "x")], 1.0);
-        let b = encode(&m, &[("host".into(), "h".into())], 1000);
+        let b = encode(&m, &[("host".into(), "h".into())], 1000, Compat::None);
         // WriteRequest.timeseries
         assert_eq!(b[0], 0x0a);
         let body = &b[2..];
@@ -263,10 +265,25 @@ mod tests {
     }
 
     #[test]
+    fn cadvisor_mode_renames_pushed_series() {
+        use crate::metrics::{Base, Kind};
+        let mut m = MetricSet::new();
+        let base = std::sync::Arc::new(Base { clean: vec![("container".into(), "web".into())], cadvisor: vec![("name".into(), "web".into())] });
+        m.push_with("container_memory_swap_bytes", "S.", Kind::Gauge, &base, &[], 1.0);
+        let has = |b: &[u8], s: &str| b.windows(s.len()).any(|w| w == s.as_bytes());
+        // Label names as encoded: length byte, name, then the value's tag.
+        let (container, name) = ("\x09container\x12", "\x04name\x12");
+        let clean = encode(&m, &[], 0, Compat::None);
+        assert!(has(&clean, "container_memory_swap_bytes") && has(&clean, container) && !has(&clean, name));
+        let old = encode(&m, &[], 0, Compat::Cadvisor);
+        assert!(has(&old, "container_memory_swap") && !has(&old, "swap_bytes") && has(&old, name) && !has(&old, container));
+    }
+
+    #[test]
     fn extra_labels_do_not_duplicate() {
         let mut m = MetricSet::new();
         m.gauge("x", "X.", &[("host", "own")], 1.0);
-        let b = encode(&m, &[("host".into(), "cfg".into())], 0);
+        let b = encode(&m, &[("host".into(), "cfg".into())], 0, Compat::None);
         assert_eq!(b.windows(4).filter(|w| *w == b"host").count(), 1);
     }
 }

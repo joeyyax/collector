@@ -1,9 +1,42 @@
+use crate::config::Compat;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 
-/// Labels shared by many samples, e.g. one container's identity.
-pub type LabelSet = Arc<[(String, String)]>;
+/// Labels shared by many samples, e.g. one container's identity, in both naming modes.
+pub type LabelSet = Arc<Base>;
+
+#[derive(Debug, Default)]
+pub struct Base {
+    pub clean: Vec<(String, String)>,
+    pub cadvisor: Vec<(String, String)>,
+}
+
+impl Base {
+    fn get(&self, mode: Compat) -> &[(String, String)] {
+        match mode {
+            Compat::None => &self.clean,
+            Compat::Cadvisor => &self.cadvisor,
+        }
+    }
+}
+
+/// Clean metric names that cAdvisor spells differently.
+const CADVISOR_NAMES: [(&str, &str); 5] = [
+    ("container_memory_rss_bytes", "container_memory_rss"),
+    ("container_memory_cache_bytes", "container_memory_cache"),
+    ("container_memory_mapped_file_bytes", "container_memory_mapped_file"),
+    ("container_memory_kernel_usage_bytes", "container_memory_kernel_usage"),
+    ("container_memory_swap_bytes", "container_memory_swap"),
+];
+
+/// The name a family renders under in `mode`.
+pub fn family_name(name: &str, mode: Compat) -> &str {
+    match mode {
+        Compat::None => name,
+        Compat::Cadvisor => CADVISOR_NAMES.iter().find(|(c, _)| *c == name).map_or(name, |(_, a)| a),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
@@ -28,12 +61,12 @@ pub struct Sample {
 }
 
 impl Sample {
-    pub fn all_labels(&self) -> impl Iterator<Item = &(String, String)> {
-        self.base.iter().flat_map(|b| b.iter()).chain(self.labels.iter())
+    pub fn all_labels(&self, mode: Compat) -> impl Iterator<Item = &(String, String)> {
+        self.base.iter().flat_map(move |b| b.get(mode).iter()).chain(self.labels.iter())
     }
 
-    fn has_labels(&self) -> bool {
-        !self.labels.is_empty() || self.base.as_ref().is_some_and(|b| !b.is_empty())
+    fn has_labels(&self, mode: Compat) -> bool {
+        !self.labels.is_empty() || self.base.as_ref().is_some_and(|b| !b.get(mode).is_empty())
     }
 }
 
@@ -90,32 +123,33 @@ impl MetricSet {
         self.families.iter().map(|f| f.samples.len()).sum()
     }
 
-    pub fn render(&self, extra: &[(String, String)]) -> String {
+    pub fn render(&self, extra: &[(String, String)], mode: Compat) -> String {
         let mut out = String::with_capacity(self.len() * 96);
         for f in &self.families {
             if f.samples.is_empty() {
                 continue;
             }
-            write_header(&mut out, f);
+            let name = family_name(&f.name, mode);
+            write_header(&mut out, f, name);
             for s in &f.samples {
-                write_sample(&mut out, &f.name, s, extra);
+                write_sample(&mut out, name, s, extra, mode);
             }
         }
         out
     }
 }
 
-fn write_header(out: &mut String, f: &Family) {
-    let _ = writeln!(out, "# HELP {} {}", f.name, f.help);
-    let _ = writeln!(out, "# TYPE {} {}", f.name, f.kind.as_str());
+fn write_header(out: &mut String, f: &Family, name: &str) {
+    let _ = writeln!(out, "# HELP {} {}", name, f.help);
+    let _ = writeln!(out, "# TYPE {} {}", name, f.kind.as_str());
 }
 
-fn write_sample(out: &mut String, name: &str, s: &Sample, extra: &[(String, String)]) {
+fn write_sample(out: &mut String, name: &str, s: &Sample, extra: &[(String, String)], mode: Compat) {
     out.push_str(name);
-    if s.has_labels() || !extra.is_empty() {
+    if s.has_labels(mode) || !extra.is_empty() {
         out.push('{');
         let mut first = true;
-        for (k, v) in extra.iter().chain(s.all_labels()) {
+        for (k, v) in extra.iter().chain(s.all_labels(mode)) {
             if !first {
                 out.push(',');
             }
@@ -135,6 +169,7 @@ fn write_sample(out: &mut String, name: &str, s: &Sample, extra: &[(String, Stri
 /// Renders a MetricSet in small pieces so a scrape never holds the whole text.
 pub struct TextReader {
     set: Arc<MetricSet>,
+    mode: Compat,
     family: usize,
     sample: usize,
     buf: String,
@@ -142,8 +177,8 @@ pub struct TextReader {
 }
 
 impl TextReader {
-    pub fn new(set: Arc<MetricSet>) -> Self {
-        Self { set, family: 0, sample: 0, buf: String::with_capacity(32 << 10), pos: 0 }
+    pub fn new(set: Arc<MetricSet>, mode: Compat) -> Self {
+        Self { set, mode, family: 0, sample: 0, buf: String::with_capacity(32 << 10), pos: 0 }
     }
 
     fn refill(&mut self) {
@@ -151,12 +186,13 @@ impl TextReader {
         self.pos = 0;
         while self.buf.len() < 16 << 10 {
             let Some(f) = self.set.families.get(self.family) else { return };
+            let name = family_name(&f.name, self.mode);
             if self.sample == 0 && !f.samples.is_empty() {
-                write_header(&mut self.buf, f);
+                write_header(&mut self.buf, f, name);
             }
             match f.samples.get(self.sample) {
                 Some(s) => {
-                    write_sample(&mut self.buf, &f.name, s, &[]);
+                    write_sample(&mut self.buf, name, s, &[], self.mode);
                     self.sample += 1;
                 }
                 None => {
@@ -223,13 +259,13 @@ mod tests {
         m.counter("x_total", "Things.", &[("a", "q\"uote\\")], 3.0);
         m.counter("x_total", "Things.", &[("a", "b")], 1.5);
         m.gauge("y", "Y.", &[], f64::NAN);
-        let base: LabelSet = vec![("name".to_string(), "web".to_string())].into();
+        let base: LabelSet = Arc::new(Base { clean: vec![("name".to_string(), "web".to_string())], cadvisor: vec![] });
         m.push_with("z", "Z.", Kind::Gauge, &base, &[("device", "sda")], 2.0);
-        let z = m.render(&[]);
+        let z = m.render(&[], Compat::None);
         assert!(z.ends_with("z{name=\"web\",device=\"sda\"} 2\n"));
         m.families.pop();
         m.index.remove("z");
-        let out = m.render(&[("host".into(), "h1".into())]);
+        let out = m.render(&[("host".into(), "h1".into())], Compat::None);
         assert_eq!(
             out,
             "# HELP x_total Things.\n# TYPE x_total counter\nx_total{host=\"h1\",a=\"q\\\"uote\\\\\"} 3\nx_total{host=\"h1\",a=\"b\"} 1.5\n# HELP y Y.\n# TYPE y gauge\ny{host=\"h1\"} NaN\n"
@@ -244,10 +280,33 @@ mod tests {
             m.counter("a_total", "A.", &[("i", &i.to_string())], i as f64);
         }
         m.gauge("b", "B.", &[], 1.0);
-        let want = m.render(&[]);
-        let mut got = String::new();
-        TextReader::new(Arc::new(m)).read_to_string(&mut got).unwrap();
-        assert_eq!(got, want);
+        let base: LabelSet = Arc::new(Base { clean: vec![("container".into(), "web".into())], cadvisor: vec![("name".into(), "web".into())] });
+        m.push_with("container_memory_rss_bytes", "R.", Kind::Gauge, &base, &[], 5.0);
+        for mode in [Compat::None, Compat::Cadvisor] {
+            let want = m.render(&[], mode);
+            let mut got = String::new();
+            TextReader::new(Arc::new(m.clone()), mode).read_to_string(&mut got).unwrap();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn cadvisor_mode_renames_families_and_labels() {
+        let mut m = MetricSet::new();
+        let base: LabelSet = Arc::new(Base {
+            clean: vec![("container".into(), "shop-web".into()), ("container_id".into(), "3f2a9c4e1b7d".into()), ("compose_project".into(), "shop".into())],
+            cadvisor: vec![("id".into(), "/system.slice/docker-3f2a.scope".into()), ("name".into(), "shop-web".into()), ("container_label_com_docker_compose_project".into(), "shop".into())],
+        });
+        m.push_with("container_memory_rss_bytes", "RSS.", Kind::Gauge, &base, &[], 7.0);
+        m.push_with("container_memory_working_set_bytes", "WS.", Kind::Gauge, &base, &[], 9.0);
+        m.gauge("node_load1", "Load.", &[], 0.5);
+        let clean = m.render(&[], Compat::None);
+        assert!(clean.contains("# TYPE container_memory_rss_bytes gauge\ncontainer_memory_rss_bytes{container=\"shop-web\",container_id=\"3f2a9c4e1b7d\",compose_project=\"shop\"} 7\n"));
+        let old = m.render(&[], Compat::Cadvisor);
+        assert!(old.contains("# TYPE container_memory_rss gauge\ncontainer_memory_rss{id=\"/system.slice/docker-3f2a.scope\",name=\"shop-web\",container_label_com_docker_compose_project=\"shop\"} 7\n"));
+        assert!(old.contains("container_memory_working_set_bytes{id="));
+        assert!(old.contains("node_load1 0.5\n") && clean.contains("node_load1 0.5\n"));
+        assert!(!old.contains("container_memory_rss_bytes") && !old.contains(",compose_project=") && !old.contains("{container=") && !old.contains("container_id="));
     }
 
     #[test]

@@ -576,11 +576,14 @@ mod tests {
 
     #[test]
     fn compose_fields_survive_dropped_compose_labels() {
-        let all: BTreeMap<String, String> = [("com.docker.compose.project", "shop"), ("com.docker.compose.service", "web"), ("com.example.team", "a")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let c = Container { id: "a".repeat(64), name: "shop-web-1".into(), all_labels: all, ..Default::default() };
+        let inspect = serde_json::from_value(serde_json::json!({
+            "Id": "a".repeat(64), "Name": "/shop-web-1", "State": {"Running": true, "Pid": 0},
+            "Config": {"Image": "shop/web:1", "Labels": {"com.docker.compose.project": "shop", "com.docker.compose.service": "web", "com.example.team": "a"}}
+        }))
+        .unwrap();
+        let rules = crate::config::Containers { labels: vec![], ..Default::default() };
+        let c = crate::containers::build(inspect, Path::new("/nonexistent"), Path::new("/nonexistent"), &rules);
+        assert!(c.labels.is_empty());
         let f = fields(&shipper(), &c);
         assert_eq!(f["compose_project"], "shop");
         assert_eq!(f["compose_service"], "web");
