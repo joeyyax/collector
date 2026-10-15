@@ -53,7 +53,7 @@ volumes:
 
 GPU hosts need the NVIDIA runtime so `nvidia-smi` is injected: `runtime: nvidia` with `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=utility`. The image uses a glibc distroless base for this; the binary itself is static.
 
-Per-container GPU memory also needs `pid: host`. `nvidia-smi` lists only the processes in its own PID namespace, so without it every container reports no GPU use and the collector logs why at startup.
+Per-container GPU memory also needs `pid: host`. `nvidia-smi` lists only the processes in its own PID namespace, so without it every container reports no GPU use and the collector logs why at startup. It also lets the collector see, and as root signal, every process on the host, so turn it on only where per-container GPU numbers are worth that.
 
 Without Docker: `collector --config collector.toml` with the default paths (`/proc`, `/sys`, `/`).
 
