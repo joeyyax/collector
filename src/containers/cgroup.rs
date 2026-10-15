@@ -94,8 +94,11 @@ pub struct Raw {
     pub mem_kernel: u64,
     pub oom_kills: u64,
     pub io: Vec<IoStat>,
+    /// Tasks (threads) from `pids.current`.
     pub pids: u64,
     pub pids_max: Option<u64>,
+    /// Processes listed in `cgroup.procs` here and in child cgroups; None when the file is missing.
+    pub procs: Option<u64>,
     /// PSI by resource; a resource whose `*.pressure` file is missing is absent.
     pub pressure: Vec<(&'static str, Pressure)>,
 }
@@ -135,8 +138,20 @@ pub fn read_cgroup(dir: &Path) -> Option<Raw> {
         io: read(dir.join("io.stat")).map(|s| parse_io_stat(&s)).unwrap_or_default(),
         pids: read_u64(dir.join("pids.current")).unwrap_or(0),
         pids_max: read_limit(dir.join("pids.max")).flatten(),
+        procs: count_procs(dir),
         pressure: PRESSURE.iter().filter_map(|r| Some((*r, parse_pressure(&read(dir.join(format!("{r}.pressure")))?)))).collect(),
     })
+}
+
+/// Lines in `cgroup.procs` of `dir` and every child cgroup, since a process lives only in a leaf.
+pub fn count_procs(dir: &Path) -> Option<u64> {
+    let mut n = read(dir.join("cgroup.procs"))?.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            n += count_procs(&e.path()).unwrap_or(0);
+        }
+    }
+    Some(n)
 }
 
 /// Finds the container's cgroup under the systemd or cgroupfs layout.
@@ -223,7 +238,11 @@ mod tests {
         std::fs::write(cg.join("memory.max"), "max\n").unwrap();
         std::fs::write(cg.join("memory.stat"), "anon 600\nfile 400\ninactive_file 300\nactive_file 100\nfile_mapped 50\nkernel 20\n").unwrap();
         std::fs::write(cg.join("memory.events"), "low 0\nhigh 0\nmax 0\noom 2\noom_kill 1\n").unwrap();
-        std::fs::write(cg.join("pids.current"), "7\n").unwrap();
+        std::fs::write(cg.join("pids.current"), "42\n").unwrap();
+        // Five processes holding 42 threads, two of them in a child cgroup.
+        std::fs::write(cg.join("cgroup.procs"), "4242\n4250\n4251\n").unwrap();
+        std::fs::create_dir_all(cg.join("worker")).unwrap();
+        std::fs::write(cg.join("worker/cgroup.procs"), "4300\n4301\n").unwrap();
         std::fs::write(cg.join("pids.max"), "max\n").unwrap();
         std::fs::write(cg.join("cpu.pressure"), "some avg10=0.00 avg60=0.00 avg300=0.00 total=3000000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1000000\n").unwrap();
         std::fs::write(cg.join("memory.pressure"), "some avg10=0.00 avg60=0.00 avg300=0.00 total=10\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=5\n").unwrap();
@@ -235,10 +254,13 @@ mod tests {
         assert_eq!(r.mem_peak, Some(1500));
         assert_eq!(r.working_set(), 700);
         assert_eq!(r.oom_kills, 1);
-        assert_eq!(r.pids, 7);
+        assert_eq!(r.pids, 42);
+        assert_eq!(r.procs, Some(5));
         // No io.pressure in the fixture, as on kernels or hosts without PSI.
         assert_eq!(r.pressure, vec![("cpu", Pressure { some_usec: Some(3_000_000), full_usec: Some(1_000_000) }), ("memory", Pressure { some_usec: Some(10), full_usec: Some(5) })]);
         assert!(find_dir(&dir, "zzz", Path::new("/nonexistent"), 0).is_none());
+        std::fs::remove_file(cg.join("cgroup.procs")).unwrap();
+        assert_eq!(read_cgroup(&found).unwrap().procs, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -393,8 +393,11 @@ pub struct NetOut {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PidsOut {
+    /// Tasks, counting each thread.
     pub current: u64,
     pub limit: Option<u64>,
+    /// Processes; null when `cgroup.procs` can't be read.
+    pub processes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -527,7 +530,10 @@ impl ContainerCollector {
                 io_prev.insert(dev, (s.rbytes, s.wbytes));
             }
 
-            put(m, "container_processes", "Number of processes running inside the container.", Kind::Gauge, l, raw.pids as f64);
+            if let Some(n) = raw.procs {
+                put(m, "container_processes", "Number of processes running inside the container.", Kind::Gauge, l, n as f64);
+            }
+            put(m, "container_threads", "Number of threads running inside the container.", Kind::Gauge, l, raw.pids as f64);
             if let Some(max) = raw.pids_max {
                 put(m, "container_spec_pids_limit", "Pids limit for the container.", Kind::Gauge, l, max as f64);
             }
@@ -566,7 +572,7 @@ impl ContainerCollector {
             }
 
             next_prev.insert(c.id.clone(), Prev { at: now, usage_usec: raw.cpu.usage_usec, net: net_prev, io: io_prev });
-            out.push(ContainerSnapshot { meta: c.clone(), lifecycle: life, cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max }, gpus, writable_layer });
+            out.push(ContainerSnapshot { meta: c.clone(), lifecycle: life, cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max, processes: raw.procs }, gpus, writable_layer });
         }
         self.prev = next_prev;
         let stopped = stopped
@@ -727,6 +733,8 @@ mod tests {
         let cg = root.join(format!("sys/fs/cgroup/system.slice/docker-{id}.scope"));
         std::fs::create_dir_all(&cg).unwrap();
         std::fs::write(cg.join("cpu.stat"), "usage_usec 1000\n").unwrap();
+        std::fs::write(cg.join("pids.current"), "68\n").unwrap();
+        std::fs::write(cg.join("cgroup.procs"), "4242\n4243\n4244\n4245\n").unwrap();
         std::fs::create_dir_all(root.join("proc/4242")).unwrap();
         std::fs::write(root.join("proc/4242/cgroup"), format!("0::/system.slice/docker-{id}.scope\n")).unwrap();
         let mut cfg = Config::default();
@@ -753,6 +761,8 @@ mod tests {
         assert!(text.contains(r#"{container="shop-web",container_id="cccccccccccc",image="shop/web:1",compose_project="shop"}"#));
         assert!(!text.contains("container_label_com_docker_compose_project"));
         assert!(!text.contains("container_pressure_"), "no *.pressure files in the fixture");
+        assert!(text.lines().any(|l| l.starts_with("container_processes{") && l.ends_with("} 4")));
+        assert!(text.lines().any(|l| l.starts_with("container_threads{") && l.ends_with("} 68")));
         assert!(!text.contains("com_example") && !text.contains("web-team") && !text.contains("d-123"));
         assert!(text.lines().any(|l| l.starts_with("container_gpu_memory_used_bytes{") && l.ends_with(r#",uuid="1111"} 1048576"#)));
         let old = m.render(&[], config::Compat::Cadvisor);
@@ -763,6 +773,7 @@ mod tests {
         assert_eq!(snaps[0].meta.labels.keys().collect::<Vec<_>>(), ["com.docker.compose.project", "com.example.deploy-id", "com.example.owner"]);
         assert_eq!(snaps[0].gpus, vec![GpuOut { uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
         assert!(text.contains(r#"container_writable_layer_bytes{container="shop-web",container_id="cccccccccccc",image="shop/web:1",compose_project="shop"} 4096"#));
+        assert_eq!(serde_json::to_value(&snaps[0]).unwrap()["pids"], serde_json::json!({"current": 68, "limit": null, "processes": 4}));
         assert_eq!(serde_json::to_value(&snaps[0]).unwrap()["writable_layer"], serde_json::json!({"bytes": 4096, "measured_at": 1.5}));
     }
 
