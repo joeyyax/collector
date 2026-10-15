@@ -142,8 +142,9 @@ impl Api {
 
     fn health(&self) -> Response<std::io::Cursor<Vec<u8>>> {
         let snap = self.shared.read();
-        let age = util::now_secs() - snap.collected_at;
-        let fresh = snap.collected_at > 0.0 && age < self.interval.as_secs_f64() * 3.0 + 5.0;
+        let now = util::now_secs();
+        let age = now - snap.collected_at;
+        let fresh = fresh(snap.collected_at, now, self.interval);
         let body = Health {
             status: if fresh { "ok" } else { "stale" },
             version: VERSION,
@@ -186,6 +187,13 @@ struct ContainerItem<'a> {
     interval_seconds: f64,
 }
 
+/// A collection is fresh until three intervals plus 5 s have passed.
+fn fresh(collected_at: f64, now: f64, interval: Duration) -> bool {
+    collected_at > 0.0 && now - collected_at < interval.as_secs_f64() * 3.0 + STALE_SLACK
+}
+
+const STALE_SLACK: f64 = 5.0;
+
 fn millis(secs: f64) -> f64 {
     (secs * 1000.0).round() / 1000.0
 }
@@ -214,6 +222,17 @@ mod tests {
         assert!(constant_eq(b"Bearer abc", b"Bearer abc"));
         assert!(!constant_eq(b"Bearer abd", b"Bearer abc"));
         assert!(!constant_eq(b"Bearer ab", b"Bearer abc"));
+    }
+
+    #[test]
+    fn stale_after_three_intervals_plus_slack() {
+        let i = Duration::from_secs(15);
+        assert!(!fresh(0.0, 100.0, i));
+        assert!(fresh(1000.0, 1049.9, i));
+        assert!(!fresh(1000.0, 1050.0, i));
+        // A 1 s interval still tolerates one slow collection.
+        assert!(fresh(1000.0, 1004.0, Duration::from_secs(1)));
+        assert!(!fresh(1000.0, 1008.0, Duration::from_secs(1)));
     }
 
     #[test]

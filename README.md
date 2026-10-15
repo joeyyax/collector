@@ -87,7 +87,7 @@ The binary listens on `127.0.0.1:9273` by default (`listen`). The image sets `0.
 | Endpoint | Auth | Returns |
 |---|---|---|
 | `GET /metrics` | token | Prometheus text format, gzip when the client accepts it |
-| `GET /health` | none | `{"status":"ok","version":...}`; 503 when the last collection is older than three intervals |
+| `GET /health` | none | `{"status":"ok","version":...}`; 503 when the last collection is older than three intervals plus 5 s |
 | `GET /api/v1/host` | token | Host snapshot with derived rates |
 | `GET /api/v1/containers` | token | Every running container with its latest readings |
 | `GET /api/v1/containers/:id` | token | One container by full ID, name, or ID prefix of four or more characters |

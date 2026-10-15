@@ -12,7 +12,7 @@ Rates (`*_per_second`, `usage_ratio`, `usage_cores`, `busy_ratio`) cover the tim
 {"status": "ok", "version": "0.2.0", "host": "web-1", "last_collect_age_seconds": 3.2, "collected_at": 1791656309.731, "interval_seconds": 15.0, "docker": true, "logs_last_success": 1791656289}
 ```
 
-`status` is `stale` with HTTP 503 when the last collection is older than three intervals. `last_collect_age_seconds` and `collected_at` are `null` before the first collection. `docker` is present when container metrics are on, `logs_last_success` (epoch seconds) when logs are on.
+`status` is `stale` with HTTP 503 when the last collection is older than three intervals plus 5 s. The slack keeps one slow collection, such as a `statfs` timeout, from flipping a short interval to stale. `last_collect_age_seconds` and `collected_at` are `null` before the first collection. `docker` is present when container metrics are on, `logs_last_success` (epoch seconds) when logs are on.
 
 ## `GET /api/v1/host`
 
