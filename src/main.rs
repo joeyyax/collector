@@ -185,10 +185,11 @@ fn collect(host: Option<&mut host::HostCollector>, ctrs: Option<&mut containers:
     let started = Instant::now();
     let mut m = MetricSet::new();
     let host = host.map(|h| h.collect(&mut m));
-    let containers = ctrs.map(|c| c.collect(&mut m)).unwrap_or_default();
+    let collected = ctrs.map(|c| c.collect(&mut m)).unwrap_or_default();
     Snapshot {
         host,
-        containers,
+        containers: collected.running,
+        stopped: collected.stopped,
         metrics: Arc::new(m),
         collected_at: util::now_secs(),
         collect_seconds: started.elapsed().as_secs_f64(),

@@ -1,4 +1,4 @@
-use crate::containers::ContainerSnapshot;
+use crate::containers::{ContainerSnapshot, StoppedSnapshot};
 use crate::host::HostSnapshot;
 use crate::metrics::MetricSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 pub struct Snapshot {
     pub host: Option<HostSnapshot>,
     pub containers: Vec<ContainerSnapshot>,
+    pub stopped: Vec<StoppedSnapshot>,
     pub metrics: Arc<MetricSet>,
     pub collected_at: f64,
     pub collect_seconds: f64,

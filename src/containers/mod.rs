@@ -1,5 +1,6 @@
 pub mod cgroup;
 pub mod docker;
+pub mod lifecycle;
 
 use crate::config::{self, Config};
 use crate::host::{emit_net, gpu, procfs};
@@ -11,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -39,6 +40,13 @@ pub struct Container {
     pub cgroup: Option<PathBuf>,
     #[serde(skip)]
     pub metric_labels: LabelSet,
+    /// Docker's `State.Status` at the last inspect.
+    #[serde(skip)]
+    pub status: String,
+    #[serde(skip)]
+    pub health: Option<String>,
+    #[serde(skip)]
+    pub restart_count: u64,
 }
 
 pub const COMPOSE_PROJECT: &str = "com.docker.compose.project";
@@ -60,13 +68,14 @@ impl Container {
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<RwLock<HashMap<String, Arc<Container>>>>,
+    life: Arc<Mutex<lifecycle::Tracker>>,
     pub docker_ok: Arc<AtomicBool>,
     synced: Arc<AtomicBool>,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(HashMap::new())), docker_ok: Arc::new(AtomicBool::new(false)), synced: Arc::new(AtomicBool::new(false)) }
+        Self { inner: Arc::default(), life: Arc::default(), docker_ok: Arc::new(AtomicBool::new(false)), synced: Arc::new(AtomicBool::new(false)) }
     }
 
     /// True once the first full sync has finished.
@@ -84,7 +93,7 @@ impl Registry {
     pub fn start(&self, cfg: &Config) {
         let docker = Docker::new(&cfg.paths.docker_socket);
         let (tx, rx) = channel::<Option<String>>();
-        spawn_events(docker.clone(), tx.clone());
+        spawn_events(docker.clone(), tx.clone(), self.life.clone());
         let me = self.clone();
         let cgroot = cfg.paths.sys.join("fs/cgroup");
         let proc = cfg.paths.proc.clone();
@@ -146,15 +155,29 @@ impl Registry {
             }
             match docker.inspect(&s.id) {
                 Ok(i) => {
-                    let c = build(i, cgroot, proc, rules);
+                    let c = self.inspected(i, cgroot, proc, rules);
                     next.insert(c.id.clone(), Arc::new(c));
                 }
                 Err(e) => log::debug!("{e}"),
             }
         }
+        for (id, c) in current.into_iter().filter(|(id, _)| !next.contains_key(id)) {
+            let st = docker.inspect(&id).ok().map(|i| i.state);
+            self.life.lock().unwrap().stopped(c, st.as_ref(), util::now_secs());
+        }
         log::debug!("registry: {} running containers", next.len());
         *self.inner.write().unwrap() = next;
         self.synced.store(true, Ordering::Relaxed);
+    }
+
+    /// Builds a container from inspect and records its lifecycle state.
+    fn inspected(&self, i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &config::Containers) -> Container {
+        let mut life = self.life.lock().unwrap();
+        life.inspected(&i.id, &i.state);
+        if counts(&i.state) {
+            life.running(&i.id);
+        }
+        build(i, cgroot, proc, rules)
     }
 }
 
@@ -162,14 +185,22 @@ impl Registry {
     /// Re-inspects only the containers an event named, dropping any that are gone or no longer running.
     fn update(&self, docker: &Docker, cgroot: &Path, proc: &Path, rules: &config::Containers, ids: &[String]) {
         let mut next = self.inner.read().unwrap().clone();
+        let now = util::now_secs();
         for id in ids {
             match docker.inspect(id) {
                 Ok(i) if counts(&i.state) => {
-                    let c = build(i, cgroot, proc, rules);
+                    let c = self.inspected(i, cgroot, proc, rules);
                     next.insert(c.id.clone(), Arc::new(c));
                 }
-                _ => {
-                    next.remove(id);
+                Ok(i) => {
+                    let st = i.state.clone();
+                    let c = next.remove(id).unwrap_or_else(|| Arc::new(self.inspected(i, cgroot, proc, rules)));
+                    self.life.lock().unwrap().stopped(c, Some(&st), now);
+                }
+                Err(_) => {
+                    if let Some(c) = next.remove(id) {
+                        self.life.lock().unwrap().stopped(c, None, now);
+                    }
                 }
             }
         }
@@ -182,14 +213,18 @@ fn counts(s: &docker::InspectState) -> bool {
     s.running && !s.paused
 }
 
-fn spawn_events(docker: Docker, tx: Sender<Option<String>>) {
+fn spawn_events(docker: Docker, tx: Sender<Option<String>>, life: Arc<Mutex<lifecycle::Tracker>>) {
     std::thread::Builder::new()
         .name("docker-events".into())
         .spawn(move || {
             let mut backoff = Duration::from_secs(1);
             loop {
                 let res = docker.events(|ev| {
-                    if ev.kind == "container" && matches!(ev.action.as_str(), "start" | "restart" | "die" | "destroy" | "rename" | "pause" | "unpause") {
+                    if ev.kind != "container" {
+                        return;
+                    }
+                    life.lock().unwrap().event(&ev.actor.id, &ev.action, &ev.actor.attributes, ev.at(util::now_secs()));
+                    if matches!(ev.action.as_str(), "start" | "restart" | "die" | "destroy" | "rename" | "pause" | "unpause") || ev.action.starts_with("health_status") {
                         let _ = tx.send(Some(ev.actor.id));
                     }
                 });
@@ -232,6 +267,9 @@ pub(crate) fn build(i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &conf
         log_driver: i.host_config.log_config.kind,
         tty: i.config.tty,
         cgroup,
+        status: i.state.status,
+        health: i.state.health.map(|h| h.status).filter(|h| !h.is_empty()),
+        restart_count: i.restart_count,
         id: i.id,
         ..Default::default()
     };
@@ -269,12 +307,37 @@ pub fn keep_label(patterns: &[String], key: &str) -> bool {
 pub struct ContainerSnapshot {
     #[serde(flatten)]
     pub meta: Arc<Container>,
+    pub lifecycle: Lifecycle,
     pub cpu: CpuOut,
     pub memory: MemOut,
     pub io: Vec<IoOut>,
     pub network: Vec<NetOut>,
     pub pids: PidsOut,
     pub gpus: Vec<GpuOut>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Lifecycle {
+    pub state: String,
+    pub health: Option<String>,
+    pub restarts_total: u64,
+    pub last_exit: Option<lifecycle::Exit>,
+}
+
+/// A container that isn't running, kept for `lifecycle::RETAIN_SECS` after it stopped.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoppedSnapshot {
+    #[serde(flatten)]
+    pub meta: Arc<Container>,
+    pub lifecycle: Lifecycle,
+    /// Unix seconds since the container stopped.
+    pub stopped_at: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Collected {
+    pub running: Vec<ContainerSnapshot>,
+    pub stopped: Vec<StoppedSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -348,16 +411,26 @@ impl ContainerCollector {
         Self { registry, proc: cfg.paths.proc.clone(), sys: cfg.paths.sys.clone(), network: cfg.containers.network, prev: HashMap::new(), devices: HashMap::new(), gpu }
     }
 
-    pub fn collect(&mut self, m: &mut MetricSet) -> Vec<ContainerSnapshot> {
+    pub fn collect(&mut self, m: &mut MetricSet) -> Collected {
         let now = util::now_secs();
         let mut out = Vec::new();
         let mut next_prev = HashMap::new();
         let ctrs = self.registry.all();
+        let ids: HashSet<&str> = ctrs.iter().map(|c| c.id.as_str()).collect();
         let mut gpu_mem = match &self.gpu {
-            Some(w) => gpu_by_container(&self.proc, &w.apps(), &ctrs.iter().map(|c| c.id.as_str()).collect()),
+            Some(w) => gpu_by_container(&self.proc, &w.apps(), &ids),
             None => HashMap::new(),
         };
+        let (exits, stopped) = {
+            let mut life = self.registry.life.lock().unwrap();
+            life.expire(now, &ids);
+            let exits: HashMap<String, lifecycle::Exit> = ctrs.iter().filter_map(|c| Some((c.id.clone(), life.exit(&c.id)?))).collect();
+            let stopped: Vec<_> = life.stopped_list().into_iter().map(|s| (life.exit(&s.meta.id), s)).collect();
+            (exits, stopped)
+        };
         for c in &ctrs {
+            let life = Lifecycle { state: c.status.clone(), health: c.health.clone(), restarts_total: c.restart_count, last_exit: exits.get(&c.id).copied() };
+            emit_lifecycle(m, &c.metric_labels, &life);
             let Some(dir) = &c.cgroup else { continue };
             let Some(raw) = cgroup::read_cgroup(dir) else { continue };
             let prev = self.prev.remove(&c.id);
@@ -464,10 +537,18 @@ impl ContainerCollector {
             }
 
             next_prev.insert(c.id.clone(), Prev { at: now, usage_usec: raw.cpu.usage_usec, net: net_prev });
-            out.push(ContainerSnapshot { meta: c.clone(), cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max }, gpus });
+            out.push(ContainerSnapshot { meta: c.clone(), lifecycle: life, cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max }, gpus });
         }
         self.prev = next_prev;
-        out
+        let stopped = stopped
+            .into_iter()
+            .map(|(exit, s)| {
+                let life = Lifecycle { state: s.state, health: None, restarts_total: s.meta.restart_count, last_exit: exit };
+                emit_lifecycle(m, &s.meta.metric_labels, &life);
+                StoppedSnapshot { meta: s.meta, lifecycle: life, stopped_at: s.since }
+            })
+            .collect();
+        Collected { running: out, stopped }
     }
 
     fn device_name(&mut self, major: u32, minor: u32) -> String {
@@ -489,6 +570,20 @@ pub fn gpu_by_container(proc: &Path, apps: &[gpu::App], ids: &HashSet<&str>) -> 
         *out.entry(id.to_string()).or_default().entry(a.uuid.clone()).or_default() += a.memory_used_bytes;
     }
     out
+}
+
+fn emit_lifecycle(m: &mut MetricSet, l: &LabelSet, life: &Lifecycle) {
+    if !life.state.is_empty() {
+        m.push_with("container_state", "Docker state of the container; 1 for the current state.", Kind::Gauge, l, &[("state", &life.state)], 1.0);
+    }
+    if let Some(h) = &life.health {
+        m.push_with("container_health", "Docker health check status of the container; 1 for the current status.", Kind::Gauge, l, &[("health", h)], 1.0);
+    }
+    put(m, "container_restarts_total", "Times Docker restarted the container under its restart policy.", Kind::Counter, l, life.restarts_total as f64);
+    if let Some(e) = life.last_exit {
+        put(m, "container_last_exit_code", "Exit code of the container's last exit.", Kind::Gauge, l, e.code as f64);
+        put(m, "container_oom_killed", "Whether Docker reported an OOM kill before the container's last exit.", Kind::Gauge, l, if e.oom_killed { 1.0 } else { 0.0 });
+    }
 }
 
 fn put(m: &mut MetricSet, name: &str, help: &'static str, kind: Kind, labels: &LabelSet, v: f64) {
@@ -620,7 +715,7 @@ mod tests {
         registry.inner.write().unwrap().insert(c.id.clone(), Arc::new(c));
         let gpu = gpu::Watcher::with_apps(cfg.interval, vec![gpu::App { pid: 4242, uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
         let mut m = MetricSet::new();
-        let snaps = ContainerCollector::new(&cfg, registry, Some(gpu)).collect(&mut m);
+        let snaps = ContainerCollector::new(&cfg, registry, Some(gpu)).collect(&mut m).running;
         let _ = std::fs::remove_dir_all(&root);
 
         let text = m.render(&[], config::Compat::None);
@@ -636,5 +731,68 @@ mod tests {
         assert!(!old.contains("com_example") && !old.contains("container_id="));
         assert_eq!(snaps[0].meta.labels.keys().collect::<Vec<_>>(), ["com.docker.compose.project", "com.example.deploy-id", "com.example.owner"]);
         assert_eq!(snaps[0].gpus, vec![GpuOut { uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
+    }
+
+    #[test]
+    fn lifecycle_series_for_running_and_stopped_containers() {
+        let root = std::env::temp_dir().join(format!("collector-life-{}", std::process::id()));
+        let cfg = Config::default();
+        let inspect = |id: &str, name: &str, state: serde_json::Value| -> docker::Inspect {
+            serde_json::from_value(serde_json::json!({"Id": id, "Name": name, "RestartCount": 2, "State": state, "Config": {"Image": "app:1"}})).unwrap()
+        };
+        let (web, job) = ("a".repeat(64), "b".repeat(64));
+        let registry = Registry::new();
+        let none = BTreeMap::new();
+        {
+            let mut life = registry.life.lock().unwrap();
+            life.event(&web, "oom", &none, 100.0);
+            life.event(&web, "die", &BTreeMap::from([("exitCode".to_string(), "137".to_string())]), 100.5);
+            life.event(&web, "start", &none, 101.0);
+        }
+        let c = registry.inspected(inspect(&web, "/web", serde_json::json!({"Status": "running", "Running": true, "Pid": 0, "Health": {"Status": "healthy"}})), &root, &root, &cfg.containers);
+        registry.inner.write().unwrap().insert(web.clone(), Arc::new(c));
+        let gone = registry.inspected(inspect(&job, "/job", serde_json::json!({"Status": "running", "Running": true, "Pid": 0})), &root, &root, &cfg.containers);
+        let finished = util::now_secs() - 30.0;
+        let st = docker::InspectState { status: "exited".into(), exit_code: 3, finished_at: format_rfc3339(finished), ..Default::default() };
+        registry.life.lock().unwrap().stopped(Arc::new(gone), Some(&st), util::now_secs());
+
+        let mut m = MetricSet::new();
+        let got = ContainerCollector::new(&cfg, registry, None).collect(&mut m);
+        let text = m.render(&[], config::Compat::None);
+        let has = |line: &str| text.lines().any(|l| l == line);
+        let web_l = format!(r#"container="web",container_id="{}",image="app:1""#, &web[..12]);
+        let job_l = format!(r#"container="job",container_id="{}",image="app:1""#, &job[..12]);
+        assert!(has(&format!(r#"container_state{{{web_l},state="running"}} 1"#)));
+        assert!(has(&format!(r#"container_health{{{web_l},health="healthy"}} 1"#)));
+        assert!(has(&format!("container_restarts_total{{{web_l}}} 2")));
+        assert!(has(&format!("container_last_exit_code{{{web_l}}} 137")));
+        assert!(has(&format!("container_oom_killed{{{web_l}}} 1")));
+        assert!(has(&format!(r#"container_state{{{job_l},state="exited"}} 1"#)));
+        assert!(has(&format!("container_last_exit_code{{{job_l}}} 3")));
+        assert!(has(&format!("container_oom_killed{{{job_l}}} 0")));
+        assert!(!text.contains(&format!(r#"container_health{{{job_l}"#)));
+        // No cgroup, so no resource readings for either.
+        assert!(got.running.is_empty() && !text.contains("container_cpu_usage_seconds_total"));
+        assert_eq!(got.stopped.len(), 1);
+        assert_eq!(got.stopped[0].lifecycle.last_exit.map(|e| e.code), Some(3));
+        assert!((got.stopped[0].stopped_at - finished).abs() < 1.0);
+    }
+
+    fn format_rfc3339(t: f64) -> String {
+        let (days, secs) = ((t as i64).div_euclid(86400), (t as i64).rem_euclid(86400));
+        let (y, m, d) = civil_from_days(days);
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs / 60 % 60, secs % 60)
+    }
+
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (yoe + era * 400 + i64::from(m <= 2), m, d)
     }
 }

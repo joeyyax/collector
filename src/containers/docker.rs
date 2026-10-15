@@ -31,6 +31,8 @@ pub struct Inspect {
     pub log_path: String,
     #[serde(rename = "State")]
     pub state: InspectState,
+    #[serde(rename = "RestartCount", default)]
+    pub restart_count: u64,
     #[serde(rename = "HostConfig", default)]
     pub host_config: HostConfig,
     #[serde(rename = "Config", default)]
@@ -47,6 +49,22 @@ pub struct InspectState {
     pub pid: u32,
     #[serde(rename = "StartedAt", default)]
     pub started_at: String,
+    #[serde(rename = "Status", default)]
+    pub status: String,
+    #[serde(rename = "ExitCode", default)]
+    pub exit_code: i64,
+    #[serde(rename = "OOMKilled", default)]
+    pub oom_killed: bool,
+    #[serde(rename = "FinishedAt", default)]
+    pub finished_at: String,
+    #[serde(rename = "Health", default)]
+    pub health: Option<Health>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Health {
+    #[serde(rename = "Status", default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,12 +99,27 @@ pub struct Event {
     pub action: String,
     #[serde(rename = "Actor", default)]
     pub actor: Actor,
+    #[serde(rename = "timeNano", default)]
+    pub time_nano: u64,
+}
+
+impl Event {
+    /// Unix seconds the event happened, or `now` when Docker didn't say.
+    pub fn at(&self, now: f64) -> f64 {
+        if self.time_nano > 0 {
+            self.time_nano as f64 / 1e9
+        } else {
+            now
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Actor {
     #[serde(rename = "ID", default)]
     pub id: String,
+    #[serde(rename = "Attributes", default)]
+    pub attributes: BTreeMap<String, String>,
 }
 
 pub struct Response<R> {
@@ -315,5 +348,20 @@ mod tests {
         assert!(i.state.running && !i.state.paused);
         assert_eq!(i.host_config.log_config.kind, "json-file");
         assert_eq!(i.config.labels.unwrap()["com.docker.compose.project"], "shop");
+        assert!(i.state.health.is_none());
+    }
+
+    #[test]
+    fn parses_exited_inspect_and_die_event() {
+        let j = r#"{"Id":"abc","Name":"/worker","RestartCount":4,
+            "State":{"Status":"exited","Running":false,"Paused":false,"Restarting":false,"OOMKilled":true,"Dead":false,"Pid":0,"ExitCode":137,
+                     "StartedAt":"2026-10-10T07:02:25.289401507Z","FinishedAt":"2026-10-10T07:12:25.5Z","Health":{"Status":"unhealthy","FailingStreak":3,"Log":[]}}}"#;
+        let i: Inspect = serde_json::from_str(j).unwrap();
+        assert_eq!((i.state.status.as_str(), i.state.exit_code, i.state.oom_killed, i.restart_count), ("exited", 137, true, 4));
+        assert_eq!(i.state.health.unwrap().status, "unhealthy");
+        let e = r#"{"status":"die","id":"abc","from":"busybox","Type":"container","Action":"die","Actor":{"ID":"abc","Attributes":{"exitCode":"137","image":"busybox","name":"worker"}},"scope":"local","time":1791656309,"timeNano":1791656309731000000}"#;
+        let ev: Event = serde_json::from_str(e).unwrap();
+        assert_eq!(ev.actor.attributes["exitCode"], "137");
+        assert_eq!(ev.at(0.0), 1791656309.731);
     }
 }
