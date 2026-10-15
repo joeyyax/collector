@@ -367,6 +367,8 @@ pub struct IoOut {
     pub device: String,
     pub read_bytes_total: u64,
     pub write_bytes_total: u64,
+    pub read_bytes_per_second: Option<f64>,
+    pub write_bytes_per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -394,6 +396,7 @@ struct Prev {
     at: f64,
     usage_usec: u64,
     net: HashMap<String, (u64, u64)>,
+    io: HashMap<String, (u64, u64)>,
 }
 
 pub struct ContainerCollector {
@@ -493,6 +496,7 @@ impl ContainerCollector {
             }
 
             let mut io = Vec::new();
+            let mut io_prev = HashMap::new();
             for s in &raw.io {
                 let dev = self.device_name(s.major, s.minor);
                 let dl: [(&str, &str); 1] = [("device", &dev)];
@@ -500,7 +504,15 @@ impl ContainerCollector {
                 m.push_with("container_fs_writes_bytes_total", "Cumulative count of bytes written.", Kind::Counter, l, &dl, s.wbytes as f64);
                 m.push_with("container_fs_reads_total", "Cumulative count of reads completed.", Kind::Counter, l, &dl, s.rios as f64);
                 m.push_with("container_fs_writes_total", "Cumulative count of writes completed.", Kind::Counter, l, &dl, s.wios as f64);
-                io.push(IoOut { device: dev, read_bytes_total: s.rbytes, write_bytes_total: s.wbytes });
+                let p = prev.and_then(|p| p.io.get(&dev));
+                io.push(IoOut {
+                    device: dev.clone(),
+                    read_bytes_total: s.rbytes,
+                    write_bytes_total: s.wbytes,
+                    read_bytes_per_second: p.and_then(|p| rate(p.0, s.rbytes, dt)),
+                    write_bytes_per_second: p.and_then(|p| rate(p.1, s.wbytes, dt)),
+                });
+                io_prev.insert(dev, (s.rbytes, s.wbytes));
             }
 
             put(m, "container_processes", "Number of processes running inside the container.", Kind::Gauge, l, raw.pids as f64);
@@ -536,7 +548,7 @@ impl ContainerCollector {
                 m.push_with("container_gpu_memory_used_bytes", "GPU memory held by the container's processes.", Kind::Gauge, l, &[("uuid", &g.uuid)], g.memory_used_bytes as f64);
             }
 
-            next_prev.insert(c.id.clone(), Prev { at: now, usage_usec: raw.cpu.usage_usec, net: net_prev });
+            next_prev.insert(c.id.clone(), Prev { at: now, usage_usec: raw.cpu.usage_usec, net: net_prev, io: io_prev });
             out.push(ContainerSnapshot { meta: c.clone(), lifecycle: life, cpu, memory, io, network, pids: PidsOut { current: raw.pids, limit: raw.pids_max }, gpus });
         }
         self.prev = next_prev;

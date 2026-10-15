@@ -12,6 +12,9 @@ pub struct Config {
     pub listen: String,
     #[serde(with = "dur")]
     pub interval: Duration,
+    /// Collection interval while a client follows `/api/v1/stream`.
+    #[serde(with = "dur")]
+    pub live_interval: Duration,
     pub log_level: String,
     pub paths: Paths,
     pub host_metrics: HostMetrics,
@@ -219,6 +222,7 @@ impl Default for Config {
             host: String::new(),
             listen: "127.0.0.1:9273".into(),
             interval: Duration::from_secs(15),
+            live_interval: Duration::from_secs(5),
             log_level: "info".into(),
             paths: Paths::default(),
             host_metrics: HostMetrics::default(),

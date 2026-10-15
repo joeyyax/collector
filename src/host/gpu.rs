@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -74,12 +75,13 @@ impl Rounds {
 pub struct Watcher {
     latest: Arc<Mutex<BTreeMap<u32, (Gpu, Instant)>>>,
     apps: Arc<Mutex<Rounds>>,
+    per_container: Arc<AtomicBool>,
     interval: Duration,
 }
 
 impl Watcher {
     pub fn start(nvidia_smi: &str, interval: Duration, auto: bool, per_process: PerProcess) -> Self {
-        let w = Self { latest: Arc::default(), apps: Arc::default(), interval };
+        let w = Self { latest: Arc::default(), apps: Arc::default(), per_container: Arc::default(), interval };
         if cfg!(not(feature = "gpu")) {
             log::info!("gpu metrics off: built without the gpu feature");
             return w;
@@ -132,6 +134,7 @@ impl Watcher {
             PerProcess::Off => {}
             PerProcess::NoHostPid => log::info!("gpu: per-container memory off: nvidia-smi lists only processes in its own PID namespace; run the collector with pid: host"),
             PerProcess::On => {
+                self.per_container.store(true, Ordering::Relaxed);
                 let (me, bin) = (self.clone(), bin.to_string());
                 std::thread::Builder::new().name("gpu-apps".into()).spawn(move || me.run_apps(&bin)).expect("spawn gpu-apps");
             }
@@ -162,7 +165,7 @@ impl Watcher {
 
     #[cfg(test)]
     pub fn with_apps(interval: Duration, apps: Vec<App>) -> Self {
-        let w = Self { latest: Arc::default(), apps: Arc::default(), interval };
+        let w = Self { latest: Arc::default(), apps: Arc::default(), per_container: Arc::new(AtomicBool::new(true)), interval };
         let now = Instant::now();
         apps.into_iter().for_each(|a| w.apps.lock().unwrap().feed(a, now, interval));
         w
@@ -171,6 +174,11 @@ impl Watcher {
     /// GPU processes from the newest round; empty when no process has a GPU context.
     pub fn apps(&self) -> Vec<App> {
         self.apps.lock().unwrap().current(Instant::now(), self.interval * 3 / 2)
+    }
+
+    /// Whether per-process GPU memory is being read, so a container's empty `gpus` means it holds no GPU memory.
+    pub fn per_container(&self) -> bool {
+        self.per_container.load(Ordering::Relaxed)
     }
 
     /// Readings newer than three intervals, by GPU index.

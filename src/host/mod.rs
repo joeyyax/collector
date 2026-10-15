@@ -25,6 +25,8 @@ pub struct HostSnapshot {
     pub disks: Vec<Disk>,
     pub networks: Vec<Network>,
     pub sensors: Vec<hwmon::Sensor>,
+    /// Served beside the host, not inside it; see `api`.
+    #[serde(skip)]
     pub gpus: Vec<gpu::Gpu>,
 }
 

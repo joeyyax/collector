@@ -75,7 +75,7 @@ fn main() {
         gpu::Watcher::start(&cfg.gpu.nvidia_smi, cfg.interval, cfg.gpu.enabled == Toggle::Auto, per_process)
     });
     let mut host = cfg.host_metrics.enabled.then(|| host::HostCollector::new(&cfg, gpu.clone()));
-    let mut ctrs = cfg.containers.enabled.then(|| containers::ContainerCollector::new(&cfg, registry.clone(), gpu));
+    let mut ctrs = cfg.containers.enabled.then(|| containers::ContainerCollector::new(&cfg, registry.clone(), gpu.clone()));
     let shared = Shared::default();
 
     if once {
@@ -83,7 +83,7 @@ fn main() {
         while cfg.containers.enabled && !registry.synced() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let s = collect(host.as_mut(), ctrs.as_mut());
+        let s = collect(host.as_mut(), ctrs.as_mut(), gpu.as_ref());
         print!("{}", s.metrics.render(&[], config::Compat::None));
         return;
     }
@@ -107,10 +107,15 @@ fn main() {
                 while cfg.containers.enabled && !synced.synced() && Instant::now() < wait {
                     std::thread::sleep(Duration::from_millis(50));
                 }
+                let mut last: Option<Instant> = None;
                 while !util::shutdown::requested() {
-                    let started = Instant::now();
-                    shared.store(collect(host.as_mut(), ctrs.as_mut()));
-                    util::shutdown::sleep(cfg.interval.saturating_sub(started.elapsed()));
+                    let wait = until_due(last.map(|l| l.elapsed()), shared.live.subscribers() > 0, cfg.interval, cfg.live_interval);
+                    if !wait.is_zero() {
+                        util::shutdown::sleep(wait.min(Duration::from_millis(100)));
+                        continue;
+                    }
+                    last = Some(Instant::now());
+                    shared.store(collect(host.as_mut(), ctrs.as_mut(), gpu.as_ref()));
                 }
             })
             .expect("spawn collect");
@@ -139,7 +144,7 @@ fn main() {
         docker_ok: registry.docker_ok.clone(),
         containers_enabled: cfg.containers.enabled,
     };
-    if let Err(e) = api.start(&cfg.listen, cfg.api.workers) {
+    if let Err(e) = api.start(&cfg.listen, cfg.api.workers).map(drop) {
         log::error!("{e}");
         std::process::exit(1);
     }
@@ -181,17 +186,46 @@ mod signals {
     }
 }
 
-fn collect(host: Option<&mut host::HostCollector>, ctrs: Option<&mut containers::ContainerCollector>) -> Snapshot {
+/// Time left before the next collection: `live_interval` apart while streamed, `interval` otherwise.
+fn until_due(since_last: Option<Duration>, live: bool, interval: Duration, live_interval: Duration) -> Duration {
+    let every = if live { live_interval.min(interval) } else { interval };
+    since_last.map_or(Duration::ZERO, |d| every.saturating_sub(d))
+}
+
+fn collect(host: Option<&mut host::HostCollector>, ctrs: Option<&mut containers::ContainerCollector>, gpu: Option<&gpu::Watcher>) -> Snapshot {
     let started = Instant::now();
     let mut m = MetricSet::new();
-    let host = host.map(|h| h.collect(&mut m));
+    let mut host = host.map(|h| h.collect(&mut m));
     let collected = ctrs.map(|c| c.collect(&mut m)).unwrap_or_default();
+    let gpus = match &mut host {
+        Some(h) => std::mem::take(&mut h.gpus),
+        None => gpu.map(|g| g.latest()).unwrap_or_default(),
+    };
     Snapshot {
         host,
+        gpus,
+        gpu_per_container: gpu.map(|g| g.per_container()),
         containers: collected.running,
         stopped: collected.stopped,
         metrics: Arc::new(m),
         collected_at: util::now_secs(),
         collect_seconds: started.elapsed().as_secs_f64(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collects_faster_while_streamed() {
+        let (i, live, s) = (Duration::from_secs(15), Duration::from_secs(5), Duration::from_secs);
+        assert_eq!(until_due(None, false, i, live), Duration::ZERO);
+        assert_eq!(until_due(Some(s(4)), false, i, live), s(11));
+        assert_eq!(until_due(Some(s(4)), true, i, live), s(1));
+        // A subscriber arriving 7 s after a collection gets the next one at once.
+        assert_eq!(until_due(Some(s(7)), true, i, live), Duration::ZERO);
+        // live_interval never slows collection down.
+        assert_eq!(until_due(Some(s(1)), true, s(2), s(5)), s(1));
     }
 }
