@@ -1,0 +1,11 @@
+# Image defaults: host paths are mounted under /host and /rootfs.
+# Loopback inside a container is unreachable, so publish the port on 127.0.0.1 or a private address instead.
+listen = "0.0.0.0:9273"
+
+[paths]
+proc = "/host/proc"
+sys = "/host/sys"
+rootfs = "/rootfs"
+docker_socket = "/var/run/docker.sock"
+docker_containers = "/var/lib/docker/containers"
+state_dir = "/var/lib/collector"

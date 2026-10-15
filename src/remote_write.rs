@@ -1,0 +1,272 @@
+use crate::config::RemoteWrite;
+use crate::metrics::MetricSet;
+use crate::state::Shared;
+use crate::util::{self, log, shutdown};
+use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+/// Encodes a Prometheus remote-write WriteRequest (protobuf), one sample per series.
+pub fn encode(m: &MetricSet, extra: &[(String, String)], ts_ms: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(m.len() * 128);
+    let mut series = Vec::with_capacity(256);
+    let mut labels: Vec<(&str, &str)> = Vec::with_capacity(16);
+    for f in &m.families {
+        for s in &f.samples {
+            labels.clear();
+            labels.push(("__name__", &f.name));
+            for (k, v) in extra.iter().chain(s.all_labels()) {
+                if !labels.iter().any(|(lk, _)| *lk == k) {
+                    labels.push((k, v));
+                }
+            }
+            labels.sort_by(|a, b| a.0.cmp(b.0));
+            series.clear();
+            for (k, v) in &labels {
+                let mut lb = Vec::with_capacity(k.len() + v.len() + 4);
+                bytes_field(&mut lb, 1, k.as_bytes());
+                bytes_field(&mut lb, 2, v.as_bytes());
+                bytes_field(&mut series, 1, &lb);
+            }
+            let mut sample = Vec::with_capacity(20);
+            sample.push(0x09);
+            sample.extend_from_slice(&s.value.to_le_bytes());
+            sample.push(0x10);
+            varint(&mut sample, ts_ms as u64);
+            bytes_field(&mut series, 2, &sample);
+            bytes_field(&mut out, 1, &series);
+        }
+    }
+    out
+}
+
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn bytes_field(out: &mut Vec<u8>, field: u32, data: &[u8]) {
+    varint(out, ((field << 3) | 2) as u64);
+    varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+pub struct Client {
+    agent: ureq::Agent,
+    url: String,
+    labels: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+}
+
+impl Client {
+    pub fn new(cfg: &RemoteWrite) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new().timeout(cfg.timeout).build(),
+            url: cfg.url.clone(),
+            labels: cfg.labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            headers: cfg.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
+    /// Encodes one WriteRequest, snappy-compressed as the protocol requires.
+    pub fn encode(&self, m: &MetricSet, ts_ms: i64) -> Result<Vec<u8>, String> {
+        snap::raw::Encoder::new().compress_vec(&encode(m, &self.labels, ts_ms)).map_err(|e| e.to_string())
+    }
+
+    pub fn send(&self, body: &[u8]) -> Result<(), String> {
+        let mut req = self
+            .agent
+            .post(&self.url)
+            .set("Content-Type", "application/x-protobuf")
+            .set("Content-Encoding", "snappy")
+            .set("X-Prometheus-Remote-Write-Version", "0.1.0");
+        for (k, v) in &self.headers {
+            req = req.set(k, v);
+        }
+        match req.send_bytes(body) {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(code, r)) => Err(format!("remote write: HTTP {code}: {}", r.into_string().unwrap_or_default().trim())),
+            Err(e) => Err(format!("remote write: {e}")),
+        }
+    }
+}
+
+struct Pending {
+    body: Vec<u8>,
+    samples: usize,
+}
+
+/// Bounded FIFO of encoded pushes; the oldest go first when it's full.
+pub struct Queue {
+    items: VecDeque<Pending>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl Queue {
+    pub fn new(max_bytes: usize) -> Self {
+        Self { items: VecDeque::new(), bytes: 0, max_bytes }
+    }
+
+    /// Adds a push and returns how many samples were dropped to make room.
+    pub fn push(&mut self, body: Vec<u8>, samples: usize) -> usize {
+        self.bytes += body.len();
+        self.items.push_back(Pending { body, samples });
+        let mut dropped = 0;
+        while self.bytes > self.max_bytes && self.items.len() > 1 {
+            let old = self.items.pop_front().unwrap();
+            self.bytes -= old.body.len();
+            dropped += old.samples;
+        }
+        dropped
+    }
+
+    fn front(&self) -> Option<&Pending> {
+        self.items.front()
+    }
+
+    fn pop(&mut self) {
+        if let Some(p) = self.items.pop_front() {
+            self.bytes -= p.body.len();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn samples(&self) -> usize {
+        self.items.iter().map(|p| p.samples).sum()
+    }
+}
+
+/// Encodes each new collection into the queue and sends from its head with backoff; on shutdown, drains until the deadline.
+pub fn run(cfg: RemoteWrite, shared: Shared, shutdown_timeout: Duration) {
+    let client = Client::new(&cfg);
+    let mut queue = Queue::new(cfg.queue_bytes);
+    let stats = shared.remote.clone();
+    let mut last = 0.0;
+    let mut next_enqueue = Instant::now() + cfg.interval;
+    let mut next_send = Instant::now();
+    let mut backoff = Duration::from_secs(1);
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let now = Instant::now();
+        if deadline.is_none() && shutdown::requested() {
+            deadline = Some(now + shutdown_timeout);
+            next_send = now;
+        }
+        if deadline.is_none() && now >= next_enqueue {
+            next_enqueue = now + cfg.interval;
+            let (m, at) = {
+                let s = shared.read();
+                (s.metrics.clone(), s.collected_at)
+            };
+            if at > last {
+                last = at;
+                match client.encode(&m, (at * 1000.0) as i64) {
+                    Ok(body) => {
+                        let dropped = queue.push(body, m.len());
+                        if dropped > 0 {
+                            stats.dropped_samples.fetch_add(dropped as u64, Ordering::Relaxed);
+                            log::warn!("remote write: queue full, dropped {dropped} samples");
+                        }
+                    }
+                    Err(e) => log::warn!("remote write: encode: {e}"),
+                }
+            }
+        }
+        while Instant::now() >= next_send {
+            let Some(p) = queue.front() else { break };
+            match client.send(&p.body) {
+                Ok(()) => {
+                    queue.pop();
+                    backoff = Duration::from_secs(1);
+                    stats.pushes.fetch_add(1, Ordering::Relaxed);
+                    stats.last_success.store(util::now_secs() as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("{e}; {} pushes queued, retrying in {}s", queue.len(), backoff.as_secs());
+                    next_send = Instant::now() + backoff;
+                    backoff = (backoff * 2).min(cfg.max_backoff);
+                }
+            }
+        }
+        stats.queue_len.store(queue.len() as u64, Ordering::Relaxed);
+        stats.queue_bytes.store(queue.bytes as u64, Ordering::Relaxed);
+        if let Some(d) = deadline {
+            if queue.len() == 0 || Instant::now() >= d {
+                let left = queue.samples();
+                if left > 0 {
+                    stats.dropped_samples.fetch_add(left as u64, Ordering::Relaxed);
+                    log::warn!("remote write: shutting down with {left} samples unsent");
+                }
+                stats.stopped.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_drops_oldest_when_full() {
+        let mut q = Queue::new(25);
+        assert_eq!(q.push(vec![0; 10], 1), 0);
+        assert_eq!(q.push(vec![0; 10], 2), 0);
+        assert_eq!(q.push(vec![0; 10], 3), 1);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.samples(), 5);
+        q.pop();
+        assert_eq!(q.samples(), 3);
+        // A single oversized push is kept rather than dropped outright.
+        let mut q = Queue::new(5);
+        assert_eq!(q.push(vec![0; 10], 7), 0);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn varints() {
+        let mut v = Vec::new();
+        varint(&mut v, 300);
+        assert_eq!(v, [0xac, 0x02]);
+    }
+
+    #[test]
+    fn encodes_one_series() {
+        let mut m = MetricSet::new();
+        m.gauge("up", "Up.", &[("job", "x")], 1.0);
+        let b = encode(&m, &[("host".into(), "h".into())], 1000);
+        // WriteRequest.timeseries
+        assert_eq!(b[0], 0x0a);
+        let body = &b[2..];
+        assert_eq!(b[1] as usize, body.len());
+        // First label is __name__="up", labels sorted after it: host, job.
+        let expected_label = [0x0a, 0x0e, 0x0a, 0x08, b'_', b'_', b'n', b'a', b'm', b'e', b'_', b'_', 0x12, 0x02, b'u', b'p'];
+        assert_eq!(&body[..expected_label.len()], &expected_label);
+        let host_at = body.windows(4).position(|w| w == b"host").unwrap();
+        let job_at = body.windows(3).position(|w| w == b"job").unwrap();
+        assert!(host_at < job_at);
+        // Sample: value 1.0 as fixed64, timestamp 1000 as varint.
+        let mut sample = vec![0x12, 0x0c, 0x09];
+        sample.extend_from_slice(&1.0f64.to_le_bytes());
+        sample.extend_from_slice(&[0x10, 0xe8, 0x07]);
+        assert!(body.ends_with(&sample));
+    }
+
+    #[test]
+    fn extra_labels_do_not_duplicate() {
+        let mut m = MetricSet::new();
+        m.gauge("x", "X.", &[("host", "own")], 1.0);
+        let b = encode(&m, &[("host".into(), "cfg".into())], 0);
+        assert_eq!(b.windows(4).filter(|w| *w == b"host").count(), 1);
+    }
+}

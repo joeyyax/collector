@@ -1,0 +1,94 @@
+# Every key is optional; these are the defaults unless noted.
+# Env overrides: COLLECTOR_<KEY>, COLLECTOR_<SECTION>__<KEY> (e.g. COLLECTOR_LOGS__URL).
+
+# Defaults to <rootfs>/etc/hostname.
+host = ""
+# Loopback by default. The container image sets 0.0.0.0; publish the port on 127.0.0.1 or a private address.
+listen = "127.0.0.1:9273"
+interval = "15s"
+log_level = "info"
+# How long SIGTERM waits for the last log batch and queued remote-write pushes.
+shutdown_timeout = "10s"
+
+[api]
+# Bearer token for /metrics and /api/v1/*; /health stays open. token_file wins over token.
+token = ""
+token_file = ""
+workers = 4
+
+[paths]
+# Values for the container image; built-in defaults are /proc, /sys and /.
+proc = "/host/proc"
+sys = "/host/sys"
+rootfs = "/rootfs"
+docker_socket = "/var/run/docker.sock"
+docker_containers = "/var/lib/docker/containers"
+state_dir = "/var/lib/collector"
+
+[host_metrics]
+enabled = true
+per_cpu = true
+hwmon = true
+network_exclude = "^(veth.*)$"
+# A mount that doesn't answer within this is reported as an error and skipped until its call returns.
+statfs_timeout = "2s"
+
+[containers]
+enabled = true
+network = true
+# Docker labels copied onto metrics (container_label_*), logs and the API; `*` or a trailing `.` matches a prefix.
+# Each label multiplies series per container; see docs/metrics.md before adding per-deploy values.
+labels = ["com.docker.compose.project", "com.docker.compose.service"]
+resync = "5m"
+
+[gpu]
+# auto: use nvidia-smi when it runs, otherwise stay off.
+enabled = "auto"
+nvidia_smi = "nvidia-smi"
+
+[logs]
+enabled = false
+sink = "victorialogs"         # or "file"
+url = "http://victorialogs:9428"
+file = "/var/lib/collector/logs.jsonl"
+compress = true
+stream_fields = ["host", "container", "compose_project", "compose_service"]
+exclude_names = []
+exclude_label = "collector.logs=false"
+# Where to start on the very first run: "end" skips existing history.
+first_run = "end"
+batch_bytes = 1048576
+batch_lines = 5000
+read_bytes = 262144
+poll = "1s"
+max_backoff = "30s"
+timeout = "10s"
+parse_level = true
+promote_fields = []
+# Lines buffered from Docker logs API followers (local and journald drivers).
+api_queue_lines = 4096
+
+[logs.multiline]
+# off | indent (leading space or tab continues) | continue (pattern continues) | start (pattern starts a record)
+mode = "off"
+pattern = ""
+max_lines = 500
+max_bytes = 262144
+# A group with no new line for this long is sent as is.
+timeout = "2s"
+
+[logs.headers]
+# AccountID = "0"
+
+[remote_write]
+# Empty disables push.
+url = ""
+interval = "30s"
+timeout = "10s"
+# Failed pushes wait here for retry; the oldest are dropped past this size.
+queue_bytes = 67108864
+max_backoff = "30s"
+
+[remote_write.labels]
+# Defaults to host = <host> when empty.
+# host = "web-1"

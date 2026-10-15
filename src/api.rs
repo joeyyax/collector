@@ -1,0 +1,193 @@
+use crate::logs::Stats as LogStats;
+use crate::metrics::{MetricSet, TextReader};
+use std::io::Read;
+use crate::state::Shared;
+use crate::util::{self, log};
+use serde::Serialize;
+use std::sync::Arc;
+use std::time::Duration;
+use tiny_http::{Header, Method, Request, Response, Server};
+
+pub struct Api {
+    pub token: String,
+    pub shared: Shared,
+    pub log_stats: Option<Arc<LogStats>>,
+    pub interval: Duration,
+    pub docker_ok: Arc<std::sync::atomic::AtomicBool>,
+    pub containers_enabled: bool,
+}
+
+use crate::VERSION;
+
+impl Api {
+    /// Binds `listen` and serves on `workers` threads.
+    pub fn start(self, listen: &str, workers: usize) -> Result<(), String> {
+        let server = Arc::new(Server::http(listen).map_err(|e| format!("listen {listen}: {e}"))?);
+        log::info!("listening on {listen} ({} workers, auth {})", workers.max(1), if self.token.is_empty() { "off" } else { "on" });
+        let api = Arc::new(self);
+        for i in 0..workers.max(1) {
+            let (server, api) = (server.clone(), api.clone());
+            std::thread::Builder::new()
+                .name(format!("http-{i}"))
+                .spawn(move || loop {
+                    match server.recv() {
+                        Ok(req) => api.handle(req),
+                        Err(e) => log::warn!("http: {e}"),
+                    }
+                })
+                .map_err(|e| format!("spawn http worker: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn authorized(&self, req: &Request) -> bool {
+        if self.token.is_empty() {
+            return true;
+        }
+        let want = format!("Bearer {}", self.token);
+        req.headers().iter().any(|h| h.field.equiv("Authorization") && constant_eq(h.value.as_str().as_bytes(), want.as_bytes()))
+    }
+
+    fn handle(&self, req: Request) {
+        if *req.method() != Method::Get && *req.method() != Method::Head {
+            let _ = req.respond(Response::from_string("method not allowed\n").with_status_code(405));
+            return;
+        }
+        let path = req.url().split('?').next().unwrap_or("/").trim_end_matches('/').to_string();
+        if path == "/health" || path == "/healthz" {
+            let _ = req.respond(self.health());
+            return;
+        }
+        if !self.authorized(&req) {
+            let res = json(401, &Error { error: "unauthorized" }).with_header(Header::from_bytes("WWW-Authenticate", "Bearer").unwrap());
+            let _ = req.respond(res);
+            return;
+        }
+        if path == "/metrics" {
+            let gzip = req.headers().iter().any(|h| h.field.equiv("Accept-Encoding") && h.value.as_str().contains("gzip"));
+            let body = self.metrics_body();
+            let ctype = Header::from_bytes("Content-Type", "text/plain; version=0.0.4; charset=utf-8").unwrap();
+            let _ = if gzip {
+                let enc = flate2::read::GzEncoder::new(body, flate2::Compression::fast());
+                req.respond(Response::new(200.into(), vec![ctype, Header::from_bytes("Content-Encoding", "gzip").unwrap()], enc, None, None))
+            } else {
+                req.respond(Response::new(200.into(), vec![ctype], body, None, None))
+            };
+            return;
+        }
+        let res = match path.as_str() {
+            "/api/v1/host" => match &self.shared.read().host {
+                Some(h) => json(200, h),
+                None => json(503, &Error { error: "no data yet" }),
+            },
+            "/api/v1/containers" => json(200, &self.shared.read().containers),
+            p if p.starts_with("/api/v1/containers/") => {
+                let key = &p["/api/v1/containers/".len()..];
+                let snap = self.shared.read();
+                let found = snap
+                    .containers
+                    .iter()
+                    .find(|c| c.meta.id == key || c.meta.name == key)
+                    .or_else(|| if key.len() >= 4 { snap.containers.iter().find(|c| c.meta.id.starts_with(key)) } else { None });
+                match found {
+                    Some(c) => json(200, c),
+                    None => json(404, &Error { error: "container not found" }),
+                }
+            }
+            "" => text(200, "collector: /metrics /health /api/v1/host /api/v1/containers /api/v1/containers/:id\n", "text/plain; charset=utf-8"),
+            _ => json(404, &Error { error: "not found" }),
+        };
+        let _ = req.respond(res);
+    }
+
+    /// Streams the last collection, then the collector's own metrics.
+    fn metrics_body(&self) -> impl Read + Send {
+        let set = self.shared.read().metrics.clone();
+        let mut own = MetricSet::new();
+        self.process_metrics(&mut own);
+        TextReader::new(set).chain(std::io::Cursor::new(own.render(&[]).into_bytes()))
+    }
+
+    fn process_metrics(&self, m: &mut MetricSet) {
+        if let Some((ut, st, rss)) = util::read("/proc/self/stat").and_then(|s| crate::host::procfs::parse_pid_stat(&s)) {
+            // SAFETY: sysconf has no preconditions.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as f64;
+            m.counter("process_cpu_seconds_total", "Total user and system CPU time spent in seconds.", &[], (ut + st) as f64 / util::clk_tck());
+            m.gauge("process_resident_memory_bytes", "Resident memory size in bytes.", &[], rss as f64 * page);
+        }
+        m.gauge("collector_heap_bytes", "Bytes currently allocated on the heap.", &[], crate::alloc::live_bytes() as f64);
+        m.gauge("collector_build_info", "Collector version.", &[("version", VERSION)], 1.0);
+        let snap = self.shared.read();
+        m.gauge("collector_collect_duration_seconds", "Time the last collection took.", &[], snap.collect_seconds);
+        m.gauge("collector_last_collect_timestamp_seconds", "Time of the last collection.", &[], snap.collected_at);
+        m.gauge("collector_series", "Series produced by the last collection.", &[], snap.metrics.len() as f64);
+        m.gauge("collector_containers", "Containers measured in the last collection.", &[], snap.containers.len() as f64);
+        drop(snap);
+        if self.containers_enabled {
+            m.gauge("collector_docker_up", "Whether the Docker API answered the last sync.", &[], if self.docker_ok.load(std::sync::atomic::Ordering::Relaxed) { 1.0 } else { 0.0 });
+        }
+        if let Some(s) = &self.log_stats {
+            s.emit(m);
+        }
+        self.shared.remote_emit(m);
+    }
+
+    fn health(&self) -> Response<std::io::Cursor<Vec<u8>>> {
+        let snap = self.shared.read();
+        let age = util::now_secs() - snap.collected_at;
+        let fresh = snap.collected_at > 0.0 && age < self.interval.as_secs_f64() * 3.0 + 5.0;
+        let body = Health {
+            status: if fresh { "ok" } else { "stale" },
+            version: VERSION,
+            host: snap.host.as_ref().map(|h| h.host.clone()).unwrap_or_default(),
+            last_collect_age_seconds: if snap.collected_at > 0.0 { Some((age * 1000.0).round() / 1000.0) } else { None },
+            docker: self.containers_enabled.then(|| self.docker_ok.load(std::sync::atomic::Ordering::Relaxed)),
+            logs_last_success: self.log_stats.as_ref().map(|s| s.last_success.load(std::sync::atomic::Ordering::Relaxed)),
+        };
+        json(if fresh { 200 } else { 503 }, &body)
+    }
+}
+
+#[derive(Serialize)]
+struct Error {
+    error: &'static str,
+}
+
+#[derive(Serialize)]
+struct Health {
+    status: &'static str,
+    version: &'static str,
+    host: String,
+    last_collect_age_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docker: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logs_last_success: Option<u64>,
+}
+
+fn text(code: u16, body: &str, ctype: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_data(body.as_bytes().to_vec())
+        .with_status_code(code)
+        .with_header(Header::from_bytes("Content-Type", ctype).unwrap())
+}
+
+fn json<T: Serialize + ?Sized>(code: u16, v: &T) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
+    Response::from_data(body).with_status_code(code).with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+}
+
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compares_tokens() {
+        assert!(constant_eq(b"Bearer abc", b"Bearer abc"));
+        assert!(!constant_eq(b"Bearer abd", b"Bearer abc"));
+        assert!(!constant_eq(b"Bearer ab", b"Bearer abc"));
+    }
+}

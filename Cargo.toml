@@ -1,0 +1,32 @@
+[package]
+name = "collector"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Per-host telemetry collector: host, container and GPU metrics plus container logs"
+rust-version = "1.82"
+
+[features]
+default = ["gpu", "tls", "jemalloc"]
+gpu = []
+tls = ["ureq/tls"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc = "0.2"
+tikv-jemallocator = { version = "0.6", optional = true }
+regex-lite = "0.1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+snap = "1"
+tiny_http = "0.12"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+ureq = { version = "2", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
