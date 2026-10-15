@@ -42,6 +42,7 @@ pub fn family_name(name: &str, mode: Compat) -> &str {
 pub enum Kind {
     Counter,
     Gauge,
+    Untyped,
 }
 
 impl Kind {
@@ -49,6 +50,7 @@ impl Kind {
         match self {
             Kind::Counter => "counter",
             Kind::Gauge => "gauge",
+            Kind::Untyped => "untyped",
         }
     }
 }

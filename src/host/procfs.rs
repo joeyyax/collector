@@ -226,6 +226,63 @@ fn unescape_octal(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Cumulative stall time in microseconds from a PSI file: `some` and `full` lines, each optional.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Pressure {
+    pub some_usec: Option<u64>,
+    pub full_usec: Option<u64>,
+}
+
+pub fn parse_pressure(s: &str) -> Pressure {
+    let mut p = Pressure::default();
+    for line in s.lines() {
+        let mut it = line.split_ascii_whitespace();
+        let kind = it.next();
+        let total = it.find_map(|f| f.strip_prefix("total=")).and_then(|v| v.parse().ok());
+        match kind {
+            Some("some") => p.some_usec = total,
+            Some("full") => p.full_usec = total,
+            _ => {}
+        }
+    }
+    p
+}
+
+/// The `/proc/vmstat` fields node_exporter exports by default that the collector keeps.
+pub const VMSTAT_FIELDS: [&str; 4] = ["oom_kill", "pgmajfault", "pswpin", "pswpout"];
+
+pub fn parse_vmstat(s: &str) -> Vec<(&'static str, u64)> {
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let mut it = line.split_ascii_whitespace();
+        let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
+        if let (Some(name), Ok(v)) = (VMSTAT_FIELDS.iter().find(|f| **f == k), v.parse()) {
+            out.push((*name, v));
+        }
+    }
+    out
+}
+
+/// `/proc/sys/fs/file-nr`: (allocated, maximum).
+pub fn parse_file_nr(s: &str) -> Option<(u64, u64)> {
+    let f: Vec<u64> = s.split_ascii_whitespace().map(|v| v.parse().ok()).collect::<Option<_>>()?;
+    Some((*f.first()?, *f.get(2)?))
+}
+
+/// Conntrack entries from `/proc/<pid>/net/stat/nf_conntrack`: the hex `entries` column, the same on every CPU line.
+pub fn parse_conntrack_stat(s: &str) -> Option<u64> {
+    let mut lines = s.lines();
+    let col = lines.next()?.split_ascii_whitespace().position(|h| h == "entries")?;
+    let v = lines.next()?.split_ascii_whitespace().nth(col)?;
+    u64::from_str_radix(v, 16).ok()
+}
+
+/// `/sys/class/net/<dev>/speed` in Mbit/s as bytes per second; virtual devices report -1 or fail the read.
+pub fn parse_speed_bytes(s: &str) -> Option<u64> {
+    let mbit: i64 = s.trim().parse().ok()?;
+    (mbit >= 0).then(|| mbit as u64 * 125_000)
+}
+
 /// utime + stime in ticks and RSS in pages from /proc/<pid>/stat.
 pub fn parse_pid_stat(s: &str) -> Option<(u64, u64, u64)> {
     let rest = &s[s.rfind(')')? + 2..];
@@ -301,6 +358,44 @@ mod tests {
         assert_eq!(m[0], Mount { device: "/dev/sda1".into(), mountpoint: "/".into(), fstype: "ext4".into(), readonly: false });
         assert_eq!(m[1].mountpoint, "/mnt/my share");
         assert!(m[1].readonly);
+    }
+
+    #[test]
+    fn pressure() {
+        let cpu = parse_pressure("some avg10=1.53 avg60=0.87 avg300=0.40 total=128376489\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
+        assert_eq!(cpu, Pressure { some_usec: Some(128376489), full_usec: Some(0) });
+        let irq = parse_pressure("full avg10=0.00 avg60=0.00 avg300=0.00 total=4182\n");
+        assert_eq!(irq, Pressure { some_usec: None, full_usec: Some(4182) });
+        assert_eq!(parse_pressure(""), Pressure::default());
+    }
+
+    #[test]
+    fn vmstat() {
+        let v = parse_vmstat("nr_free_pages 2939184\npgpgin 81273402\npswpin 12\npswpout 34\npgfault 9182733\npgmajfault 20931\noom_kill 3\npgmajfault_s 1\n");
+        assert_eq!(v, vec![("pswpin", 12), ("pswpout", 34), ("pgmajfault", 20931), ("oom_kill", 3)]);
+        // Kernels before 4.13 have no oom_kill line; it's left out, not zero.
+        assert!(parse_vmstat("pswpin 1\n").iter().all(|(k, _)| *k != "oom_kill"));
+    }
+
+    #[test]
+    fn file_nr() {
+        assert_eq!(parse_file_nr("9408\t0\t9223372036854775807\n"), Some((9408, 9223372036854775807)));
+        assert_eq!(parse_file_nr("9408\n"), None);
+    }
+
+    #[test]
+    fn conntrack_stat() {
+        let s = "entries  clashres found new invalid ignore delete chainlength insert insert_failed drop early_drop icmp_error  expect_new expect_create expect_delete search_restart\n\
+                 000001a2  00000000 00000000 00000000 00000005 00000a13 00000000 00000000 00000000 00000000 00000000 00000000 00000000  00000000 00000000 00000000 00000001\n\
+                 000001a2  00000000 00000000 00000000 00000002 00000311 00000000 00000000 00000000 00000000 00000000 00000000 00000000  00000000 00000000 00000000 00000000\n";
+        assert_eq!(parse_conntrack_stat(s), Some(418));
+        assert_eq!(parse_conntrack_stat("entries\n"), None);
+    }
+
+    #[test]
+    fn link_speed() {
+        assert_eq!(parse_speed_bytes("1000\n"), Some(125_000_000));
+        assert_eq!(parse_speed_bytes("-1\n"), None);
     }
 
     #[test]

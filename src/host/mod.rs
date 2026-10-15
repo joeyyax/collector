@@ -164,6 +164,7 @@ impl HostCollector {
         self.filesystems(m, &mut snap);
         let disks = self.disks(m, prev.as_ref(), dt, &mut snap);
         let nets = self.networks(m, prev.as_ref(), dt, &mut snap);
+        self.kernel(m, now);
 
         if self.hwmon {
             snap.sensors = hwmon::collect(&self.sys);
@@ -332,6 +333,7 @@ impl HostCollector {
                 continue;
             }
             emit_net(m, "node_network", None, &[("device", &n.device)], &n);
+            self.netclass(m, &n.device);
             let p = prev.and_then(|p| p.nets.get(&n.device));
             snap.networks.push(Network {
                 device: n.device.clone(),
@@ -345,6 +347,61 @@ impl HostCollector {
             out.insert(n.device.clone(), n);
         }
         out
+    }
+}
+
+impl HostCollector {
+    /// Link state, speed and MTU from sysfs; a missing or unreadable file leaves its series out.
+    fn netclass(&self, m: &mut MetricSet, dev: &str) {
+        let dir = self.sys.join("class/net").join(dev);
+        let l: [(&str, &str); 1] = [("device", dev)];
+        if let Some(state) = read(dir.join("operstate")) {
+            m.gauge("node_network_up", "Value is 1 if operstate is 'up', 0 otherwise.", &l, if state.trim() == "up" { 1.0 } else { 0.0 });
+        }
+        if let Some(v) = read(dir.join("speed")).and_then(|s| procfs::parse_speed_bytes(&s)) {
+            m.gauge("node_network_speed_bytes", "Network device speed in bytes per second.", &l, v as f64);
+        }
+        if let Some(v) = util::read_u64(dir.join("mtu")) {
+            m.gauge("node_network_mtu_bytes", "Network device MTU in bytes.", &l, v as f64);
+        }
+    }
+
+    /// Kernel identity, clock, vmstat, PSI, file handles and conntrack. Each file that's missing leaves its series out.
+    fn kernel(&self, m: &mut MetricSet, now: f64) {
+        let sysctl = |k: &str| read(self.proc.join("sys").join(k)).map(|s| s.trim().to_string());
+        if let (Some(sysname), Some(release), Some(version)) = (sysctl("kernel/ostype"), sysctl("kernel/osrelease"), sysctl("kernel/version")) {
+            let domain = sysctl("kernel/domainname").unwrap_or_else(|| "(none)".into());
+            let l = [("domainname", domain.as_str()), ("machine", std::env::consts::ARCH), ("nodename", &self.host), ("release", &release), ("sysname", &sysname), ("version", &version)];
+            m.gauge("node_uname_info", "Labeled system information as provided by the uname system call.", &l, 1.0);
+        }
+        m.gauge("node_time_seconds", "System time in seconds since epoch (1970).", &[], now);
+        for (k, v) in procfs::parse_vmstat(&read(self.proc.join("vmstat")).unwrap_or_default()) {
+            m.push(&format!("node_vmstat_{k}"), "/proc/vmstat information field.", Kind::Untyped, &[], v as f64);
+        }
+        for res in ["cpu", "io", "memory", "irq"] {
+            let Some(text) = read(self.proc.join("pressure").join(res)) else { continue };
+            let p = procfs::parse_pressure(&text);
+            if let Some(v) = p.some_usec {
+                m.counter(&format!("node_pressure_{res}_waiting_seconds_total"), "Total time in seconds that processes have waited for this resource.", &[], v as f64 / 1e6);
+            }
+            if let Some(v) = p.full_usec {
+                m.counter(&format!("node_pressure_{res}_stalled_seconds_total"), "Total time in seconds no process could make progress due to this resource.", &[], v as f64 / 1e6);
+            }
+        }
+        if let Some((alloc, max)) = sysctl("fs/file-nr").and_then(|s| procfs::parse_file_nr(&s)) {
+            m.gauge("node_filefd_allocated", "File descriptor statistics: allocated.", &[], alloc as f64);
+            m.gauge("node_filefd_maximum", "File descriptor statistics: maximum.", &[], max as f64);
+        }
+        // /proc/sys/net follows the reader's network namespace; /proc/1/net is the host's.
+        let entries = read(self.proc.join("1/net/stat/nf_conntrack"))
+            .and_then(|s| procfs::parse_conntrack_stat(&s))
+            .or_else(|| sysctl("net/netfilter/nf_conntrack_count").and_then(|s| s.parse().ok()));
+        if let Some(v) = entries {
+            m.gauge("node_nf_conntrack_entries", "Number of currently allocated flow entries for connection tracking.", &[], v as f64);
+        }
+        if let Some(v) = sysctl("net/netfilter/nf_conntrack_max").and_then(|s| s.parse::<u64>().ok()) {
+            m.gauge("node_nf_conntrack_entries_limit", "Maximum size of connection tracking table.", &[], v as f64);
+        }
     }
 }
 
@@ -445,4 +502,82 @@ fn statvfs(path: &std::path::Path) -> Result<StatVfs, i32> {
         files: st.f_files as u64,
         files_free: st.f_ffree as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &std::path::Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn collector(root: &std::path::Path) -> HostCollector {
+        let mut cfg = Config { host: "web-1".into(), ..Default::default() };
+        cfg.paths.proc = root.join("proc");
+        cfg.paths.sys = root.join("sys");
+        cfg.paths.rootfs = root.join("rootfs");
+        cfg.host_metrics.hwmon = false;
+        HostCollector::new(&cfg, None)
+    }
+
+    #[test]
+    fn tier_one_metrics_from_fixtures() {
+        let root = std::env::temp_dir().join(format!("collector-host-{}", std::process::id()));
+        write(&root, "proc/sys/kernel/ostype", "Linux\n");
+        write(&root, "proc/sys/kernel/osrelease", "6.8.0-45-generic\n");
+        write(&root, "proc/sys/kernel/version", "#45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024\n");
+        write(&root, "proc/vmstat", "pgmajfault 20931\noom_kill 3\npswpin 0\npswpout 0\n");
+        write(&root, "proc/pressure/cpu", "some avg10=0.00 avg60=0.00 avg300=0.00 total=2500000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
+        write(&root, "proc/pressure/memory", "some avg10=0.00 avg60=0.00 avg300=0.00 total=1000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=500\n");
+        write(&root, "proc/sys/fs/file-nr", "9408\t0\t1048576\n");
+        write(&root, "proc/sys/net/netfilter/nf_conntrack_count", "77\n");
+        write(&root, "proc/sys/net/netfilter/nf_conntrack_max", "262144\n");
+        write(&root, "proc/1/net/dev", "Inter-|\n face |\n  eth0: 1 2 0 0 0 0 0 0 3 4 0 0 0 0 0 0\n  wg0: 1 2 0 0 0 0 0 0 3 4 0 0 0 0 0 0\n");
+        write(&root, "sys/class/net/eth0/operstate", "up\n");
+        write(&root, "sys/class/net/eth0/speed", "1000\n");
+        write(&root, "sys/class/net/eth0/mtu", "1500\n");
+        write(&root, "sys/class/net/wg0/operstate", "unknown\n");
+        write(&root, "sys/class/net/wg0/mtu", "1420\n");
+        let mut m = MetricSet::new();
+        collector(&root).collect(&mut m);
+        let _ = std::fs::remove_dir_all(&root);
+        let text = m.render(&[], crate::config::Compat::None);
+        let line = |prefix: &str| text.lines().find(|l| l.starts_with(prefix)).map(str::to_string);
+
+        assert_eq!(
+            line("node_uname_info").unwrap(),
+            format!(r##"node_uname_info{{domainname="(none)",machine="{}",nodename="web-1",release="6.8.0-45-generic",sysname="Linux",version="#45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024"}} 1"##, std::env::consts::ARCH)
+        );
+        assert!(line("node_time_seconds ").is_some());
+        assert_eq!(line("node_vmstat_oom_kill").unwrap(), "node_vmstat_oom_kill 3");
+        assert!(text.contains("# TYPE node_vmstat_pgmajfault untyped\n"));
+        assert_eq!(line("node_pressure_cpu_waiting_seconds_total").unwrap(), "node_pressure_cpu_waiting_seconds_total 2.5");
+        assert_eq!(line("node_pressure_memory_stalled_seconds_total").unwrap(), "node_pressure_memory_stalled_seconds_total 0.0005");
+        assert_eq!(line("node_filefd_maximum").unwrap(), "node_filefd_maximum 1048576");
+        assert_eq!(line("node_nf_conntrack_entries ").unwrap(), "node_nf_conntrack_entries 77");
+        assert_eq!(line("node_nf_conntrack_entries_limit").unwrap(), "node_nf_conntrack_entries_limit 262144");
+        assert_eq!(line("node_network_up{device=\"eth0\"}").unwrap(), r#"node_network_up{device="eth0"} 1"#);
+        assert_eq!(line("node_network_up{device=\"wg0\"}").unwrap(), r#"node_network_up{device="wg0"} 0"#);
+        assert_eq!(line("node_network_speed_bytes").unwrap(), r#"node_network_speed_bytes{device="eth0"} 125000000"#);
+        assert_eq!(line("node_network_mtu_bytes{device=\"wg0\"}").unwrap(), r#"node_network_mtu_bytes{device="wg0"} 1420"#);
+        // No io or irq PSI files, no wg0 speed: left out rather than zero.
+        assert!(!text.contains("node_pressure_io") && !text.contains("node_pressure_irq") && !text.contains(r#"speed_bytes{device="wg0"}"#));
+    }
+
+    #[test]
+    fn missing_files_leave_series_out() {
+        let root = std::env::temp_dir().join(format!("collector-host-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut m = MetricSet::new();
+        collector(&root).collect(&mut m);
+        let _ = std::fs::remove_dir_all(&root);
+        let names: Vec<&str> = m.families.iter().filter(|f| !f.samples.is_empty()).map(|f| f.name.as_str()).collect();
+        for absent in ["node_uname_info", "node_pressure_cpu_waiting_seconds_total", "node_vmstat_oom_kill", "node_filefd_allocated", "node_nf_conntrack_entries", "node_network_up"] {
+            assert!(!names.contains(&absent), "{absent} present without its file");
+        }
+        assert!(names.contains(&"node_time_seconds"));
+    }
 }

@@ -410,6 +410,14 @@ impl ContainerCollector {
             }
             put(m, "container_spec_memory_limit_bytes", "Memory limit for the container.", Kind::Gauge, l, raw.mem_max.unwrap_or(0) as f64);
             put(m, "container_oom_events_total", "Count of out of memory events observed for the container.", Kind::Counter, l, raw.oom_kills as f64);
+            for (res, p) in &raw.pressure {
+                if let Some(v) = p.some_usec {
+                    put(m, &format!("container_pressure_{res}_waiting_seconds_total"), "Total time duration tasks in the container have waited due to this resource.", Kind::Counter, l, v as f64 / 1e6);
+                }
+                if let Some(v) = p.full_usec {
+                    put(m, &format!("container_pressure_{res}_stalled_seconds_total"), "Total time duration no tasks in the container could make progress due to this resource.", Kind::Counter, l, v as f64 / 1e6);
+                }
+            }
 
             let mut io = Vec::new();
             for s in &raw.io {
@@ -618,6 +626,7 @@ mod tests {
         let text = m.render(&[], config::Compat::None);
         assert!(text.contains(r#"{container="shop-web",container_id="cccccccccccc",image="shop/web:1",compose_project="shop"}"#));
         assert!(!text.contains("container_label_com_docker_compose_project"));
+        assert!(!text.contains("container_pressure_"), "no *.pressure files in the fixture");
         assert!(!text.contains("com_example") && !text.contains("web-team") && !text.contains("d-123"));
         assert!(text.lines().any(|l| l.starts_with("container_gpu_memory_used_bytes{") && l.ends_with(r#",uuid="1111"} 1048576"#)));
         let old = m.render(&[], config::Compat::Cadvisor);
