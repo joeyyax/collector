@@ -1,5 +1,5 @@
 # Builds run in containers; only Docker (with buildx) is needed on the host.
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' | grep . || echo dev)
 IMAGE ?= ghcr.io/joeyyax/collector
 PLATFORMS ?= linux/amd64,linux/arm64
 ZIGBUILD ?= ghcr.io/rust-cross/cargo-zigbuild:0.23.4
@@ -12,7 +12,7 @@ ANNOTATIONS = --annotation "index:org.opencontainers.image.source=https://github
 RUN = docker run --rm -v "$(CURDIR)":/src -w /src -v collector-cargo:/usr/local/cargo/registry \
 	-e CARGO_TARGET_DIR=/src/target/docker -e COLLECTOR_VERSION=$(VERSION) $(ZIGBUILD)
 
-.PHONY: all test lint binaries image image-push checksums clean version
+.PHONY: all test lint binaries image image-push checksums clean version smoke
 
 all: test binaries
 
@@ -49,6 +49,10 @@ image: $(BUILDER)
 image-push: $(BUILDER)
 	docker buildx build --builder $(BUILDER) --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) $(ANNOTATIONS) \
 		-t $(IMAGE):$(VERSION) -t $(IMAGE):latest --push .
+
+# Pre-tag check against the local Docker daemon; see scripts/smoke.
+smoke: $(BUILDER)
+	BUILDER=$(BUILDER) VERSION=$(VERSION) scripts/smoke
 
 clean:
 	rm -rf dist target
