@@ -154,23 +154,30 @@ impl Registry {
         };
         let current = self.inner.read().unwrap().clone();
         let mut next = HashMap::new();
-        for s in list.into_iter().filter(|s| s.state == "running") {
-            if let Some(c) = current.get(&s.id) {
-                if !stale.contains(&s.id) && c.pid > 0 {
+        for s in list.into_iter().filter(|s| running(&s.state)) {
+            let cached = current.get(&s.id);
+            if let Some(c) = cached {
+                if !stale.contains(&s.id) && unchanged(c, &s, proc) {
                     next.insert(s.id.clone(), c.clone());
                     continue;
                 }
             }
             match docker.inspect(&s.id) {
-                Ok(i) => {
+                Ok(Some(i)) if running(&i.state.status) => {
                     let c = self.inspected(i, cgroot, proc, rules);
                     next.insert(c.id.clone(), Arc::new(c));
                 }
-                Err(e) => log::debug!("{e}"),
+                Ok(_) => {}
+                Err(e) => {
+                    log::debug!("{e}");
+                    if let Some(c) = cached {
+                        next.insert(s.id.clone(), c.clone());
+                    }
+                }
             }
         }
         for (id, c) in current.into_iter().filter(|(id, _)| !next.contains_key(id)) {
-            let st = docker.inspect(&id).ok().map(|i| i.state);
+            let st = docker.inspect(&id).ok().flatten().map(|i| i.state);
             self.life.lock().unwrap().stopped(c, st.as_ref(), util::now_secs());
         }
         log::debug!("registry: {} running containers", next.len());
@@ -182,7 +189,7 @@ impl Registry {
     fn inspected(&self, i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &config::Containers) -> Container {
         let mut life = self.life.lock().unwrap();
         life.inspected(&i.id, &i.state);
-        if counts(&i.state) {
+        if running(&i.state.status) {
             life.running(&i.id);
         }
         build(i, cgroot, proc, rules)
@@ -196,29 +203,47 @@ impl Registry {
         let now = util::now_secs();
         for id in ids {
             match docker.inspect(id) {
-                Ok(i) if counts(&i.state) => {
+                Ok(Some(i)) if running(&i.state.status) => {
                     let c = self.inspected(i, cgroot, proc, rules);
                     next.insert(c.id.clone(), Arc::new(c));
                 }
-                Ok(i) => {
+                Ok(Some(i)) => {
                     let st = i.state.clone();
                     let c = next.remove(id).unwrap_or_else(|| Arc::new(self.inspected(i, cgroot, proc, rules)));
                     self.life.lock().unwrap().stopped(c, Some(&st), now);
                 }
-                Err(_) => {
+                Ok(None) => {
                     if let Some(c) = next.remove(id) {
                         self.life.lock().unwrap().stopped(c, None, now);
                     }
                 }
+                Err(e) => log::debug!("{e}"),
             }
         }
         *self.inner.write().unwrap() = next;
     }
 }
 
-/// Matches the list's `state == "running"`: paused containers report Running too.
-fn counts(s: &docker::InspectState) -> bool {
-    s.running && !s.paused
+/// Docker's `running` state, from list or inspect. Paused and restarting containers report `Running: true` but aren't.
+fn running(state: &str) -> bool {
+    state == "running"
+}
+
+/// True when a full sync can keep `c` without inspecting: same health, and its pid is still in its cgroup.
+fn unchanged(c: &Container, s: &docker::Summary, proc: &Path) -> bool {
+    c.pid > 0
+        && s.health() == c.health.as_deref()
+        && read(proc.join(format!("{}/cgroup", c.pid))).is_some_and(|t| cgroup::container_id(&t, |id| id == c.id).is_some())
+}
+
+/// Sleep before reconnecting the event stream; a connection that stayed up `up` resets the backoff.
+fn reconnect_delay(backoff: &mut Duration, up: Duration) -> Duration {
+    if up >= Duration::from_secs(30) {
+        *backoff = Duration::from_secs(1);
+    }
+    let d = *backoff;
+    *backoff = (d * 2).min(Duration::from_secs(30));
+    d
 }
 
 fn spawn_events(docker: Docker, tx: Sender<Option<String>>, life: Arc<Mutex<lifecycle::Tracker>>) {
@@ -226,8 +251,10 @@ fn spawn_events(docker: Docker, tx: Sender<Option<String>>, life: Arc<Mutex<life
         .name("docker-events".into())
         .spawn(move || {
             let mut backoff = Duration::from_secs(1);
+            let mut since = 0;
             loop {
-                let res = docker.events(|ev| {
+                let began = std::time::Instant::now();
+                let res = docker.events(&mut since, |ev| {
                     if ev.kind != "container" {
                         return;
                     }
@@ -236,15 +263,15 @@ fn spawn_events(docker: Docker, tx: Sender<Option<String>>, life: Arc<Mutex<life
                         let _ = tx.send(Some(ev.actor.id));
                     }
                 });
+                let delay = reconnect_delay(&mut backoff, began.elapsed());
                 if let Err(e) = res {
-                    log::warn!("{e}; reconnecting in {}s", backoff.as_secs());
+                    log::warn!("{e}; reconnecting in {}s", delay.as_secs());
                 }
                 // Resync after a reconnect since events may have been missed.
                 if tx.send(None).is_err() {
                     return;
                 }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                std::thread::sleep(delay);
             }
         })
         .expect("spawn docker-events");
@@ -686,12 +713,90 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 mod tests {
     use super::*;
 
+    fn inspect_json(id: &str, state: &str, pid: u32, restarts: u64, extra: &str) -> String {
+        format!(r#"{{"Id":"{id}","Name":"/{id}","RestartCount":{restarts},"State":{{"Status":"{state}","Running":true,"Pid":{pid}{extra}}},"Config":{{"Image":"app:1"}}}}"#)
+    }
+
     #[test]
-    fn only_running_unpaused_containers_count() {
-        let st = |running, paused| docker::InspectState { running, paused, ..Default::default() };
-        assert!(counts(&st(true, false)));
-        assert!(!counts(&st(true, true)));
-        assert!(!counts(&st(false, false)));
+    fn restarting_containers_leave_the_running_set() {
+        let (d, r) = docker::fake::start("restarting");
+        let root = std::env::temp_dir().join(format!("collector-restarting-{}", std::process::id()));
+        let reg = Registry::new();
+        let id = "a".repeat(64);
+        r.set(&format!("/containers/{id}/json"), 200, inspect_json(&id, "running", 0, 0, ""));
+        reg.update(&d, &root, &root, &config::Containers::default(), std::slice::from_ref(&id));
+        assert_eq!(reg.all().len(), 1);
+        r.set(&format!("/containers/{id}/json"), 200, inspect_json(&id, "restarting", 0, 1, ""));
+        reg.update(&d, &root, &root, &config::Containers::default(), std::slice::from_ref(&id));
+        assert!(reg.all().is_empty());
+        assert_eq!(reg.life.lock().unwrap().stopped_list().iter().map(|s| s.state.as_str()).collect::<Vec<_>>(), ["restarting"]);
+        // The list reports `restarting` too, so a full sync agrees.
+        r.set("/containers/json", 200, format!(r#"[{{"Id":"{id}","State":"restarting","Status":"Restarting (1) 2 seconds ago"}}]"#));
+        reg.sync(&d, &root, &root, &config::Containers::default(), &[]);
+        assert!(reg.all().is_empty());
+    }
+
+    #[test]
+    fn only_a_404_removes_a_container() {
+        let (d, r) = docker::fake::start("removed");
+        let root = std::env::temp_dir().join(format!("collector-removed-{}", std::process::id()));
+        let rules = config::Containers::default();
+        let reg = Registry::new();
+        let id = "b".repeat(64);
+        let path = format!("/containers/{id}/json");
+        r.set(&path, 200, inspect_json(&id, "running", 0, 0, ""));
+        reg.update(&d, &root, &root, &rules, std::slice::from_ref(&id));
+        r.set(&path, 500, "busy");
+        reg.update(&d, &root, &root, &rules, std::slice::from_ref(&id));
+        assert_eq!(reg.all().len(), 1);
+        // A full sync keeps it too when its inspect fails.
+        r.set("/containers/json", 200, format!(r#"[{{"Id":"{id}","State":"running","Status":"Up 1 minute"}}]"#));
+        reg.sync(&d, &root, &root, &rules, std::slice::from_ref(&id));
+        assert_eq!(reg.all().len(), 1);
+        r.set(&path, 404, "{}");
+        reg.update(&d, &root, &root, &rules, std::slice::from_ref(&id));
+        assert!(reg.all().is_empty());
+        assert_eq!(reg.life.lock().unwrap().stopped_list()[0].state, "removed");
+    }
+
+    #[test]
+    fn full_sync_reinspects_containers_that_changed() {
+        let (d, r) = docker::fake::start("resync");
+        let root = std::env::temp_dir().join(format!("collector-resync-{}", std::process::id()));
+        let rules = config::Containers::default();
+        let reg = Registry::new();
+        let (same, sick, restarted) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+        let health = r#","Health":{"Status":"healthy"}"#;
+        for (id, pid, extra) in [(&same, 100, ""), (&sick, 200, health), (&restarted, 300, "")] {
+            std::fs::create_dir_all(root.join(pid.to_string())).unwrap();
+            std::fs::write(root.join(format!("{pid}/cgroup")), format!("0::/system.slice/docker-{id}.scope\n")).unwrap();
+            r.set(&format!("/containers/{id}/json"), 200, inspect_json(id, "running", pid, 0, extra));
+        }
+        reg.update(&d, &root, &root, &rules, &[same.clone(), sick.clone(), restarted.clone()]);
+        // Missed events: one went unhealthy, one restarted under a new pid.
+        let _ = std::fs::remove_dir_all(root.join("300"));
+        r.set(&format!("/containers/{sick}/json"), 200, inspect_json(&sick, "running", 200, 0, r#","Health":{"Status":"unhealthy"}"#));
+        r.set(&format!("/containers/{restarted}/json"), 200, inspect_json(&restarted, "running", 301, 4, ""));
+        r.set(
+            "/containers/json",
+            200,
+            format!(r#"[{{"Id":"{same}","State":"running","Status":"Up 1 hour"}},{{"Id":"{sick}","State":"running","Status":"Up 1 hour (unhealthy)"}},{{"Id":"{restarted}","State":"running","Status":"Up 2 seconds"}}]"#),
+        );
+        reg.sync(&d, &root, &root, &rules, &[]);
+        let _ = std::fs::remove_dir_all(&root);
+        let by_id: HashMap<String, Arc<Container>> = reg.all().into_iter().map(|c| (c.id.clone(), c)).collect();
+        assert_eq!(by_id[&sick].health.as_deref(), Some("unhealthy"));
+        assert_eq!((by_id[&restarted].pid, by_id[&restarted].restart_count), (301, 4));
+        assert_eq!(r.hits(&format!("/containers/{same}/json")), 1, "unchanged containers aren't re-inspected");
+    }
+
+    #[test]
+    fn event_backoff_resets_after_a_long_connection() {
+        let mut b = Duration::from_secs(1);
+        let delays: Vec<u64> = (0..6).map(|_| reconnect_delay(&mut b, Duration::ZERO).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30]);
+        assert_eq!(reconnect_delay(&mut b, Duration::from_secs(600)), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(&mut b, Duration::ZERO), Duration::from_secs(2));
     }
 
     #[test]

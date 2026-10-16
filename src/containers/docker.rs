@@ -17,6 +17,21 @@ pub struct Summary {
     pub id: String,
     #[serde(rename = "State", default)]
     pub state: String,
+    /// Human status, e.g. "Up 2 hours (healthy)".
+    #[serde(rename = "Status", default)]
+    pub status: String,
+}
+
+impl Summary {
+    /// Health from `status`, in inspect's terms.
+    pub fn health(&self) -> Option<&str> {
+        let inner = self.status.strip_suffix(')')?.rsplit_once('(')?.1;
+        match inner {
+            "healthy" | "unhealthy" => Some(inner),
+            "health: starting" => Some("starting"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,10 +64,6 @@ pub struct GraphDriver {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct InspectState {
-    #[serde(rename = "Running", default)]
-    pub running: bool,
-    #[serde(rename = "Paused", default)]
-    pub paused: bool,
     #[serde(rename = "Pid", default)]
     pub pid: u32,
     #[serde(rename = "StartedAt", default)]
@@ -159,21 +170,24 @@ impl Docker {
         Ok(Response { status, body })
     }
 
-    fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+    /// `Ok(None)` on 404.
+    fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Option<T>, String> {
         let mut res = self.open(path, Some(Duration::from_secs(10))).map_err(|e| format!("docker {path}: {e}"))?;
         let mut buf = Vec::new();
         res.body.read_to_end(&mut buf).map_err(|e| format!("docker {path}: {e}"))?;
-        if res.status != 200 {
-            return Err(format!("docker {path}: HTTP {}: {}", res.status, String::from_utf8_lossy(&buf).trim()));
+        match res.status {
+            200 => serde_json::from_slice(&buf).map(Some).map_err(|e| format!("docker {path}: {e}")),
+            404 => Ok(None),
+            s => Err(format!("docker {path}: HTTP {s}: {}", String::from_utf8_lossy(&buf).trim())),
         }
-        serde_json::from_slice(&buf).map_err(|e| format!("docker {path}: {e}"))
     }
 
     pub fn list(&self) -> Result<Vec<Summary>, String> {
-        self.get_json("/containers/json")
+        self.get_json("/containers/json")?.ok_or_else(|| "docker /containers/json: HTTP 404".into())
     }
 
-    pub fn inspect(&self, id: &str) -> Result<Inspect, String> {
+    /// `Ok(None)` when Docker no longer has the container.
+    pub fn inspect(&self, id: &str) -> Result<Option<Inspect>, String> {
         self.get_json(&format!("/containers/{id}/json"))
     }
 
@@ -202,19 +216,24 @@ impl Docker {
         }
     }
 
-    /// Streams container events to `f` until the connection drops.
-    pub fn events(&self, mut f: impl FnMut(Event)) -> Result<(), String> {
-        let path = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
-        let res = self.open(path, None).map_err(|e| format!("docker events: {e}"))?;
+    /// Streams container events to `f` until the connection drops, replaying from `since_ns` when set and advancing it.
+    pub fn events(&self, since_ns: &mut u64, mut f: impl FnMut(Event)) -> Result<(), String> {
+        let mut path = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D".to_string();
+        if *since_ns > 0 {
+            path += &format!("&since={}.{:09}", *since_ns / 1_000_000_000, *since_ns % 1_000_000_000);
+        }
+        let res = self.open(&path, None).map_err(|e| format!("docker events: {e}"))?;
         if res.status != 200 {
             return Err(format!("docker events: HTTP {}", res.status));
         }
+        *since_ns = (*since_ns).max(crate::util::now_secs() as u64 * 1_000_000_000);
         for line in res.body.lines() {
             let line = line.map_err(|e| format!("docker events: {e}"))?;
             if line.trim().is_empty() {
                 continue;
             }
             if let Ok(ev) = serde_json::from_str::<Event>(&line) {
+                *since_ns = (*since_ns).max(ev.time_nano);
                 f(ev);
             }
         }
@@ -311,9 +330,93 @@ impl<R: BufRead> Read for Chunked<R> {
     }
 }
 
+/// A canned Docker API on a Unix socket for tests.
+#[cfg(test)]
+pub mod fake {
+    use super::Docker;
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+
+    /// Responses by path without the query; unknown paths answer 404.
+    #[derive(Clone, Default)]
+    pub struct Routes {
+        map: Arc<Mutex<HashMap<String, (u16, String)>>>,
+        /// Every request path, with its query.
+        pub seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Routes {
+        pub fn set(&self, path: &str, status: u16, body: impl Into<String>) {
+            self.map.lock().unwrap().insert(path.to_string(), (status, body.into()));
+        }
+        pub fn hits(&self, path: &str) -> usize {
+            self.seen.lock().unwrap().iter().filter(|p| p.split('?').next() == Some(path)).count()
+        }
+    }
+
+    pub fn start(name: &str) -> (Docker, Routes) {
+        let sock = std::env::temp_dir().join(format!("collector-fake-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let l = UnixListener::bind(&sock).unwrap();
+        let routes = Routes::default();
+        let r = routes.clone();
+        std::thread::spawn(move || {
+            for mut s in l.incoming().map_while(Result::ok) {
+                let mut line = String::new();
+                if BufReader::new(s.try_clone().unwrap()).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                r.seen.lock().unwrap().push(path.clone());
+                let key = path.split('?').next().unwrap_or("");
+                let (status, body) = r.map.lock().unwrap().get(key).cloned().unwrap_or((404, "{}".into()));
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            }
+        });
+        (Docker::new(&sock), routes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspect_is_none_only_on_404() {
+        let (d, r) = fake::start("inspect");
+        assert!(d.inspect("gone").unwrap().is_none());
+        r.set("/containers/busy/json", 500, "boom");
+        assert!(d.inspect("busy").is_err());
+        r.set("/containers/web/json", 200, r#"{"Id":"web","State":{}}"#);
+        assert_eq!(d.inspect("web").unwrap().unwrap().id, "web");
+    }
+
+    #[test]
+    fn events_resume_from_the_last_event() {
+        let (d, r) = fake::start("events");
+        r.set("/events", 200, "{\"Type\":\"container\",\"Action\":\"start\",\"Actor\":{\"ID\":\"a\"},\"timeNano\":4102444800000000123}\n");
+        let mut since = 0;
+        let mut got = Vec::new();
+        assert!(d.events(&mut since, |e| got.push(e.action)).is_err());
+        assert_eq!(got, ["start"]);
+        assert_eq!(since, 4_102_444_800_000_000_123);
+        let _ = d.events(&mut since, |_| {});
+        let seen = r.seen.lock().unwrap();
+        assert!(!seen[0].contains("since="));
+        assert!(seen[1].ends_with("&since=4102444800.000000123"), "{}", seen[1]);
+    }
+
+    #[test]
+    fn list_status_gives_health() {
+        let s = |status: &str| Summary { id: String::new(), state: "running".into(), status: status.into() };
+        assert_eq!(s("Up 2 hours (healthy)").health(), Some("healthy"));
+        assert_eq!(s("Up 5 seconds (health: starting)").health(), Some("starting"));
+        assert_eq!(s("Up 1 minute (unhealthy)").health(), Some("unhealthy"));
+        assert_eq!(s("Up 3 days").health(), None);
+        assert_eq!(s("Up 3 days (Paused)").health(), None);
+    }
 
     #[test]
     fn decodes_chunked() {
@@ -353,7 +456,6 @@ mod tests {
             "Config":{"Image":"nginx:1","Labels":{"com.docker.compose.project":"shop"}}}"#;
         let i: Inspect = serde_json::from_str(j).unwrap();
         assert_eq!(i.state.pid, 42);
-        assert!(i.state.running && !i.state.paused);
         assert_eq!(i.host_config.log_config.kind, "json-file");
         assert_eq!(i.config.labels.unwrap()["com.docker.compose.project"], "shop");
         assert!(i.state.health.is_none());
