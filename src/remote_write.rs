@@ -1,6 +1,6 @@
 use crate::config::{Compat, RemoteWrite};
 use crate::metrics::{family_name, MetricSet};
-use crate::state::Shared;
+use crate::state::{RemoteStats, Shared};
 use crate::util::{self, log, shutdown};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -78,7 +78,7 @@ impl Client {
         snap::raw::Encoder::new().compress_vec(&encode(m, &self.labels, ts_ms, self.mode)).map_err(|e| e.to_string())
     }
 
-    pub fn send(&self, body: &[u8]) -> Result<(), String> {
+    pub fn send(&self, body: &[u8]) -> Result<(), SendError> {
         let mut req = self
             .agent
             .post(&self.url)
@@ -90,10 +90,44 @@ impl Client {
         }
         match req.send_bytes(body) {
             Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, r)) => Err(format!("remote write: HTTP {code}: {}", r.into_string().unwrap_or_default().trim())),
-            Err(e) => Err(format!("remote write: {e}")),
+            Err(ureq::Error::Status(code, r)) => {
+                let msg = format!("remote write: HTTP {code}: {}", r.into_string().unwrap_or_default().trim());
+                Err(if (400..500).contains(&code) && code != 429 { SendError::Rejected(msg) } else { SendError::Retry(msg) })
+            }
+            Err(e) => Err(SendError::Retry(format!("remote write: {e}"))),
         }
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SendError {
+    /// 5xx, 429 or transport errors.
+    Retry(String),
+    /// Other 4xx; resending won't help.
+    Rejected(String),
+}
+
+/// Sends from the queue head until it's empty or a push should be retried; returns that push's error.
+fn drain(client: &Client, queue: &mut Queue, stats: &RemoteStats) -> Option<String> {
+    while let Some(p) = queue.front() {
+        match client.send(&p.body) {
+            Ok(()) => {
+                stats.pushes.fetch_add(1, Ordering::Relaxed);
+                stats.last_success.store(util::now_secs() as u64, Ordering::Relaxed);
+            }
+            Err(SendError::Rejected(e)) => {
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                stats.dropped_samples.fetch_add(p.samples as u64, Ordering::Relaxed);
+                log::warn!("{e}; dropped {} samples", p.samples);
+            }
+            Err(SendError::Retry(e)) => {
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+                return Some(e);
+            }
+        }
+        queue.pop();
+    }
+    None
 }
 
 struct Pending {
@@ -181,17 +215,10 @@ pub fn run(cfg: RemoteWrite, mode: Compat, shared: Shared, shutdown_timeout: Dur
                 }
             }
         }
-        while Instant::now() >= next_send {
-            let Some(p) = queue.front() else { break };
-            match client.send(&p.body) {
-                Ok(()) => {
-                    queue.pop();
-                    backoff = Duration::from_secs(1);
-                    stats.pushes.fetch_add(1, Ordering::Relaxed);
-                    stats.last_success.store(util::now_secs() as u64, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
+        if Instant::now() >= next_send {
+            match drain(&client, &mut queue, &stats) {
+                None => backoff = Duration::from_secs(1),
+                Some(e) => {
                     log::warn!("{e}; {} pushes queued, retrying in {}s", queue.len(), backoff.as_secs());
                     next_send = Instant::now() + backoff;
                     backoff = (backoff * 2).min(cfg.max_backoff);
@@ -233,6 +260,61 @@ mod tests {
         let mut q = Queue::new(5);
         assert_eq!(q.push(vec![0; 10], 7), 0);
         assert_eq!(q.len(), 1);
+    }
+
+    /// Answers each request with the next status in `codes`.
+    fn receiver(codes: &'static [u16]) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api/v1/write", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for &code in codes {
+                let (s, _) = l.accept().unwrap();
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    r.read_line(&mut line).unwrap();
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                r.read_exact(&mut vec![0; len]).unwrap();
+                write!(&s, "HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn drops_rejected_pushes_and_keeps_retryable_ones() {
+        let cfg = RemoteWrite { url: receiver(&[400, 204, 429, 503]), ..Default::default() };
+        let client = Client::new(&cfg, Compat::None);
+        let stats = RemoteStats::default();
+        let mut q = Queue::new(1 << 20);
+        q.push(vec![1], 10);
+        q.push(vec![2], 20);
+        q.push(vec![3], 30);
+        // 400 drops the first push, 204 sends the second, 429 keeps the third.
+        assert!(drain(&client, &mut q, &stats).unwrap().contains("HTTP 429"));
+        assert_eq!((q.len(), q.samples()), (1, 30));
+        assert_eq!(stats.dropped_samples.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.pushes.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.errors.load(Ordering::Relaxed), 2);
+        assert!(drain(&client, &mut q, &stats).unwrap().contains("HTTP 503"));
+        assert_eq!(q.len(), 1);
+        assert_eq!(stats.dropped_samples.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn transport_errors_are_retried() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = RemoteWrite { url: format!("http://{}/", l.local_addr().unwrap()), ..Default::default() };
+        drop(l);
+        assert!(matches!(Client::new(&cfg, Compat::None).send(b"x"), Err(SendError::Retry(_))));
     }
 
     #[test]

@@ -96,7 +96,7 @@ impl Shared {
         m.counter("collector_remote_write_pushes_total", "Successful remote-write pushes.", &[], g(&self.remote.pushes));
         m.counter("collector_remote_write_errors_total", "Failed remote-write pushes.", &[], g(&self.remote.errors));
         m.gauge("collector_remote_write_last_success_timestamp_seconds", "Time of the last successful remote-write push.", &[], g(&self.remote.last_success));
-        m.counter("collector_remote_write_dropped_samples_total", "Samples dropped because the retry queue was full or shutdown came first.", &[], g(&self.remote.dropped_samples));
+        m.counter("collector_remote_write_dropped_samples_total", "Samples dropped because the receiver rejected them, the retry queue was full or shutdown came first.", &[], g(&self.remote.dropped_samples));
         m.gauge("collector_remote_write_queue_pushes", "Pushes waiting to be sent.", &[], g(&self.remote.queue_len));
         m.gauge("collector_remote_write_queue_bytes", "Compressed bytes waiting to be sent.", &[], g(&self.remote.queue_bytes));
     }
