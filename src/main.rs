@@ -17,7 +17,7 @@ use state::{Shared, Snapshot};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use util::log;
+use util::{log, panics};
 
 #[global_allocator]
 static GLOBAL: alloc::Counting = alloc::Counting;
@@ -72,6 +72,9 @@ fn main() {
         }
     };
     util::log::set_level(&cfg.log_level);
+    panics::install();
+    // Before any thread starts, so only the main thread's sigwait sees SIGTERM and SIGINT.
+    let signals = (!once).then(signals::block);
 
     let registry = containers::Registry::new();
     if cfg.containers.enabled || cfg.logs.enabled {
@@ -99,9 +102,6 @@ fn main() {
         print!("{}", s.metrics.render(&[], config::Compat::None));
         return;
     }
-
-    // Every thread inherits this mask, so only the main thread's sigwait sees SIGTERM and SIGINT.
-    let signals = signals::block();
 
     if cfg.containers.enabled && cfg.containers.writable_layer {
         sizes.start(registry.clone(), cfg.paths.rootfs.clone(), cfg.containers.writable_layer_interval);
@@ -140,7 +140,15 @@ fn main() {
     let remote = !cfg.remote_write.url.is_empty();
     if remote {
         let (shared, rw, mode, timeout) = (shared.clone(), cfg.remote_write.clone(), cfg.metrics.compat, cfg.shutdown_timeout);
-        std::thread::Builder::new().name("remote-write".into()).spawn(move || remote_write::run(rw, mode, shared, timeout)).expect("spawn remote-write");
+        std::thread::Builder::new()
+            .name("remote-write".into())
+            .spawn(move || {
+                while panics::guard(|| remote_write::run(rw.clone(), mode, shared.clone(), timeout)).is_none() && !util::shutdown::sleep(Duration::from_secs(5)) {
+                    log::warn!("remote write: restarting after a panic");
+                }
+                shared.remote.stopped.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn remote-write");
     }
 
     log::info!(
@@ -154,18 +162,27 @@ fn main() {
     );
     let api = api::Api {
         token: cfg.api.token.clone(),
+        host: cfg.host.clone(),
+        host_enabled: cfg.host_metrics.enabled,
         shared: shared.clone(),
         log_stats: log_stats.clone(),
         interval: cfg.interval,
         docker_ok: registry.docker_ok.clone(),
         containers_enabled: cfg.containers.enabled,
     };
-    if let Err(e) = api.start(&cfg.listen, cfg.api.workers).map(drop) {
-        log::error!("{e}");
-        std::process::exit(1);
+    match api.start(&cfg.listen, cfg.api.workers, api::WRITE_TIMEOUT) {
+        Ok(addr) if cfg.warn_open(addr) => log::warn!(
+            "API is open on {}: no token, so anyone who can reach it reads metrics and container details. Set api.token or api.token_file, or api.auth = \"off\" to silence this",
+            cfg.listen
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("{e}");
+            std::process::exit(1);
+        }
     }
 
-    let sig = signals::wait(&signals);
+    let sig = signals::wait(&signals.expect("signals are blocked unless --once"));
     log::info!("received signal {sig}; flushing");
     util::shutdown::request();
     let deadline = Instant::now() + cfg.shutdown_timeout + Duration::from_secs(2);
@@ -180,7 +197,7 @@ fn main() {
 mod signals {
     pub struct Set(libc::sigset_t);
 
-    /// Blocks SIGTERM and SIGINT in this thread and every thread spawned after.
+    /// Blocks SIGTERM and SIGINT in this thread and every thread spawned after it.
     pub fn block() -> Set {
         // SAFETY: sigset_t is plain data, initialized by sigemptyset before use.
         unsafe {
@@ -211,16 +228,16 @@ fn until_due(since_last: Option<Duration>, live: bool, interval: Duration, live_
 fn collect(host: Option<&mut host::HostCollector>, ctrs: Option<&mut containers::ContainerCollector>, gpu: Option<&gpu::Watcher>) -> Snapshot {
     let started = Instant::now();
     let mut m = MetricSet::new();
-    let mut host = host.map(|h| h.collect(&mut m));
-    let collected = ctrs.map(|c| c.collect(&mut m)).unwrap_or_default();
+    let mut host = host.and_then(|h| panics::guard(|| h.collect(&mut m)));
+    let collected = ctrs.and_then(|c| panics::guard(|| c.collect(&mut m))).unwrap_or_default();
     let gpus = match &mut host {
         Some(h) => std::mem::take(&mut h.gpus),
-        None => gpu.map(|g| g.latest()).unwrap_or_default(),
+        None => gpu.and_then(|g| panics::guard(|| g.latest())).unwrap_or_default(),
     };
     Snapshot {
         host,
         gpus,
-        gpu_per_container: gpu.map(|g| g.per_container()),
+        gpu_per_container: gpu.and_then(|g| panics::guard(|| g.per_container())),
         containers: collected.running,
         stopped: collected.stopped,
         metrics: Arc::new(m),

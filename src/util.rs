@@ -90,6 +90,29 @@ pub mod shutdown {
     }
 }
 
+pub mod panics {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Logs and counts every panic; the panicking thread still unwinds.
+    pub fn install() {
+        std::panic::set_hook(Box::new(|info| {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+            super::log::error!("panic in thread {}: {info}", std::thread::current().name().unwrap_or("unnamed"));
+        }));
+    }
+
+    pub fn count() -> u64 {
+        COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Runs `f`; None if it panicked.
+    pub fn guard<T>(f: impl FnOnce() -> T) -> Option<T> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+    }
+}
+
 pub mod log {
     use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -119,4 +142,19 @@ pub mod log {
     macro_rules! info { ($($t:tt)*) => { if $crate::util::log::enabled(2) { $crate::util::log::emit("info", format_args!($($t)*)) } } }
     macro_rules! debug { ($($t:tt)*) => { if $crate::util::log::enabled(3) { $crate::util::log::emit("debug", format_args!($($t)*)) } } }
     pub(crate) use {debug, error, info, warn_ as warn};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panics_are_caught_and_counted() {
+        panics::install();
+        let before = panics::count();
+        let t = std::thread::spawn(|| panics::guard(|| -> u8 { panic!("boom") }));
+        assert_eq!(t.join().unwrap(), None);
+        assert_eq!(panics::guard(|| 7), Some(7));
+        assert!(panics::count() > before);
+    }
 }

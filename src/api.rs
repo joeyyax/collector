@@ -16,8 +16,13 @@ use tiny_http::{Header, Method, Request, Response, Server};
 /// Concurrent `/api/v1/stream` clients; each holds a thread.
 const MAX_STREAMS: usize = 16;
 
+/// How long a response write may make no progress before the connection is dropped.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Api {
     pub token: String,
+    pub host: String,
+    pub host_enabled: bool,
     pub shared: Shared,
     pub log_stats: Option<Arc<LogStats>>,
     pub interval: Duration,
@@ -29,8 +34,10 @@ use crate::VERSION;
 
 impl Api {
     /// Binds `listen` and serves on `workers` threads; returns the bound address.
-    pub fn start(self, listen: &str, workers: usize) -> Result<Option<std::net::SocketAddr>, String> {
-        let server = Arc::new(Server::http(listen).map_err(|e| format!("listen {listen}: {e}"))?);
+    pub fn start(self, listen: &str, workers: usize, write_timeout: Duration) -> Result<Option<std::net::SocketAddr>, String> {
+        let listener = std::net::TcpListener::bind(listen).map_err(|e| format!("listen {listen}: {e}"))?;
+        set_send_timeout(&listener, write_timeout).map_err(|e| format!("listen {listen}: {e}"))?;
+        let server = Arc::new(Server::from_listener(listener, None).map_err(|e| format!("listen {listen}: {e}"))?);
         let addr = server.server_addr().to_ip();
         log::info!("listening on {listen} ({} workers, auth {})", workers.max(1), if self.token.is_empty() { "off" } else { "on" });
         let api = Arc::new(self);
@@ -40,7 +47,9 @@ impl Api {
                 .name(format!("http-{i}"))
                 .spawn(move || loop {
                     match server.recv() {
-                        Ok(req) => api.handle(req),
+                        Ok(req) => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| api.handle(req)));
+                        }
                         Err(e) => log::warn!("http: {e}"),
                     }
                 })
@@ -101,6 +110,7 @@ impl Api {
             return;
         }
         let res = match path.as_str() {
+            "/api/v1/host" if !self.host_enabled => json(404, &Error { error: "host metrics are disabled" }),
             "/api/v1/host" => {
                 let snap = self.shared.read();
                 match &snap.host {
@@ -218,6 +228,7 @@ impl Api {
         }
         m.gauge("collector_heap_bytes", "Bytes currently allocated on the heap.", &[], crate::alloc::live_bytes() as f64);
         m.gauge("collector_build_info", "Collector version.", &[("version", VERSION)], 1.0);
+        m.counter("collector_panics_total", "Panics caught in collector threads.", &[], util::panics::count() as f64);
         let snap = self.shared.read();
         m.gauge("collector_collect_duration_seconds", "Time the last collection took.", &[], snap.collect_seconds);
         m.gauge("collector_last_collect_timestamp_seconds", "Time of the last collection.", &[], snap.collected_at);
@@ -242,7 +253,8 @@ impl Api {
             gpu_per_container: (!snap.gpus.is_empty()).then(|| snap.gpu_per_container.unwrap_or(false)),
             status: if fresh { "ok" } else { "stale" },
             version: VERSION,
-            host: snap.host.as_ref().map(|h| h.host.clone()).unwrap_or_default(),
+            host: &self.host,
+            auth: if self.token.is_empty() { "open" } else { "token" },
             last_collect_age_seconds: (snap.collected_at > 0.0).then(|| millis(age)),
             collected_at: (snap.collected_at > 0.0).then(|| millis(snap.collected_at)),
             interval_seconds: self.interval.as_secs_f64(),
@@ -259,10 +271,11 @@ struct Error {
 }
 
 #[derive(Serialize)]
-struct Health {
+struct Health<'a> {
     status: &'static str,
     version: &'static str,
-    host: String,
+    host: &'a str,
+    auth: &'static str,
     last_collect_age_seconds: Option<f64>,
     collected_at: Option<f64>,
     interval_seconds: f64,
@@ -478,6 +491,19 @@ fn json<T: Serialize + ?Sized>(code: u16, v: &T) -> Response<std::io::Cursor<Vec
     Response::from_data(body).with_status_code(code).with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
 }
 
+/// Sets SO_SNDTIMEO on the listener; Linux copies it to every accepted socket.
+fn set_send_timeout(l: &std::net::TcpListener, d: Duration) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let tv = libc::timeval { tv_sec: d.as_secs() as _, tv_usec: d.subsec_micros() as _ };
+    // SAFETY: tv is a valid timeval for the duration of the call and its size is passed.
+    let rc = unsafe { libc::setsockopt(l.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&tv as *const libc::timeval).cast(), std::mem::size_of::<libc::timeval>() as libc::socklen_t) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -592,9 +618,52 @@ mod tests {
         assert!(serde_json::to_value(gpu_views(&snap)).unwrap()[0]["containers"].is_null());
     }
 
+    fn api(shared: Shared, token: &str) -> Api {
+        Api { token: token.into(), host: "web-1".into(), host_enabled: true, shared, log_stats: None, interval: Duration::from_secs(15), docker_ok: Arc::default(), containers_enabled: false }
+    }
+
     fn serve(shared: Shared, token: &str) -> std::net::SocketAddr {
-        let api = Api { token: token.into(), shared, log_stats: None, interval: Duration::from_secs(15), docker_ok: Arc::default(), containers_enabled: false };
-        api.start("127.0.0.1:0", 2).unwrap().unwrap()
+        api(shared, token).start("127.0.0.1:0", 2, WRITE_TIMEOUT).unwrap().unwrap()
+    }
+
+    #[test]
+    fn host_route_tells_disabled_from_not_yet() {
+        let addr = serve(Shared::default(), "t");
+        assert_eq!(get(addr, "/api/v1/host", "t"), (503, r#"{"error":"no data yet"}"#.to_string()));
+        let off = Api { host_enabled: false, ..api(Shared::default(), "") }.start("127.0.0.1:0", 1, WRITE_TIMEOUT).unwrap().unwrap();
+        assert_eq!(get(off, "/api/v1/host", ""), (404, r#"{"error":"host metrics are disabled"}"#.to_string()));
+        let health: serde_json::Value = serde_json::from_str(&get(off, "/health", "").1).unwrap();
+        assert_eq!((health["host"].as_str(), health["auth"].as_str()), (Some("web-1"), Some("open")));
+        let health: serde_json::Value = serde_json::from_str(&get(addr, "/health", "").1).unwrap();
+        assert_eq!(health["auth"], "token");
+    }
+
+    #[test]
+    fn accepted_sockets_inherit_the_write_timeout() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        set_send_timeout(&l, Duration::from_millis(1500)).unwrap();
+        let _c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        assert_eq!(s.write_timeout().unwrap(), Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn stalled_reader_frees_its_worker() {
+        let mut m = MetricSet::new();
+        let pad = "x".repeat(200);
+        for i in 0..150_000 {
+            m.gauge("big", "Big.", &[("i", i.to_string().as_str()), ("pad", pad.as_str())], 1.0);
+        }
+        let shared = Shared::default();
+        shared.store(Snapshot { collected_at: util::now_secs(), metrics: Arc::new(m), ..Default::default() });
+        let addr = api(shared, "").start("127.0.0.1:0", 1, Duration::from_millis(300)).unwrap().unwrap();
+        let stalled = std::net::TcpStream::connect(addr).unwrap();
+        write!(&stalled, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(get(addr, "/health", "").0));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 200);
+        drop(stalled);
     }
 
     fn get(addr: std::net::SocketAddr, path: &str, token: &str) -> (u16, String) {
