@@ -178,43 +178,10 @@ pub struct Logs {
     pub timeout: Duration,
     pub parse_level: bool,
     pub promote_fields: Vec<String>,
-    pub multiline: Multiline,
     /// Gzip request bodies to VictoriaLogs.
     pub compress: bool,
-    /// Bound on lines queued from Docker logs API followers (local and journald drivers).
-    pub api_queue_lines: usize,
     /// Docker label holding a numeric VictoriaLogs AccountID per container; empty sends everything to tenant 0.
     pub tenant_label: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MultilineMode {
-    /// Every line is its own record.
-    Off,
-    /// Lines starting with a space or tab continue the previous record.
-    Indent,
-    /// Lines matching `pattern` continue the previous record.
-    Continue,
-    /// Lines matching `pattern` start a record; all others continue it.
-    Start,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Multiline {
-    pub mode: MultilineMode,
-    pub pattern: String,
-    pub max_lines: usize,
-    pub max_bytes: usize,
-    #[serde(with = "dur")]
-    pub timeout: Duration,
-}
-
-impl Default for Multiline {
-    fn default() -> Self {
-        Self { mode: MultilineMode::Off, pattern: String::new(), max_lines: 500, max_bytes: 256 << 10, timeout: Duration::from_secs(2) }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -325,9 +292,7 @@ impl Default for Logs {
             timeout: Duration::from_secs(10),
             parse_level: true,
             promote_fields: Vec::new(),
-            multiline: Multiline::default(),
             compress: true,
-            api_queue_lines: 4096,
             tenant_label: String::new(),
         }
     }
@@ -357,7 +322,7 @@ impl Config {
             None => toml::Table::new(),
         };
         apply_env(&mut table, std::env::vars());
-        let mut cfg: Config = toml::Value::Table(table).try_into().map_err(|e| format!("config: {e}"))?;
+        let mut cfg = from_table(table)?;
         if cfg.host.is_empty() {
             cfg.host = detect_hostname(&cfg.paths.rootfs);
         }
@@ -376,7 +341,8 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        for (name, d) in [("interval", self.interval), ("live_interval", self.live_interval)] {
+        let intervals = [("interval", self.interval), ("live_interval", self.live_interval), ("logs.poll", self.logs.poll), ("remote_write.interval", self.remote_write.interval)];
+        for (name, d) in intervals {
             if d.is_zero() {
                 return Err(format!("{name} must be greater than 0"));
             }
@@ -392,6 +358,18 @@ impl Config {
     pub fn warn_open(&self, bound: Option<std::net::SocketAddr>) -> bool {
         self.api.token.is_empty() && self.api.auth != Auth::Off && bound.is_some_and(|a| !a.ip().is_loopback())
     }
+}
+
+/// Settings that no longer exist, with the version that removed them.
+const REMOVED: &[(&str, &str, &str)] = &[("logs", "multiline", "0.4.0"), ("logs", "api_queue_lines", "0.4.0")];
+
+fn from_table(table: toml::Table) -> Result<Config, String> {
+    for (section, key, version) in REMOVED {
+        if table.get(*section).and_then(|s| s.get(*key)).is_some() {
+            return Err(format!("{section}.{key} was removed in {version}; see CHANGELOG"));
+        }
+    }
+    toml::Value::Table(table).try_into().map_err(|e| format!("config: {e}"))
 }
 
 /// Maps COLLECTOR_SECTION__KEY=value onto [section] key = value.
@@ -521,7 +499,7 @@ mod tests {
     fn env_config(vars: &[(&str, &str)]) -> Result<Config, String> {
         let mut t = toml::Table::new();
         apply_env(&mut t, vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-        let cfg: Config = toml::Value::Table(t).try_into().map_err(|e| e.to_string())?;
+        let cfg = from_table(t)?;
         cfg.validate().map(|_| cfg)
     }
 
@@ -557,6 +535,8 @@ mod tests {
         assert!(env_config(&[("COLLECTOR_INTERVAL", "0")]).unwrap_err().contains("interval must be greater than 0"));
         assert!(env_config(&[("COLLECTOR_LIVE_INTERVAL", "0s")]).is_err());
         assert!(env_config(&[("COLLECTOR_INTERVAL", "100000h")]).is_err());
+        assert!(env_config(&[("COLLECTOR_LOGS__POLL", "0")]).unwrap_err().contains("logs.poll must be greater than 0"));
+        assert!(env_config(&[("COLLECTOR_REMOTE_WRITE__INTERVAL", "0s")]).unwrap_err().contains("remote_write.interval must be greater than 0"));
         assert!(env_config(&[("COLLECTOR_API__AUTH", "token")]).is_err());
         assert!(env_config(&[("COLLECTOR_API__AUTH", "token"), ("COLLECTOR_API__TOKEN", "t")]).is_ok());
         assert!(env_config(&[("COLLECTOR_API__AUTH", "off"), ("COLLECTOR_API__TOKEN", "t")]).is_err());
@@ -612,6 +592,14 @@ mod tests {
     fn rejects_unknown_keys() {
         let t: toml::Table = "nope = 1".parse().unwrap();
         assert!(toml::Value::Table(t).try_into::<Config>().is_err());
+    }
+
+    #[test]
+    fn removed_keys_name_the_version() {
+        let file = |s: &str| from_table(s.parse().unwrap()).unwrap_err();
+        assert_eq!(file("[logs.multiline]\nmode = \"indent\"\n"), "logs.multiline was removed in 0.4.0; see CHANGELOG");
+        assert_eq!(file("[logs]\napi_queue_lines = 10\n"), "logs.api_queue_lines was removed in 0.4.0; see CHANGELOG");
+        assert_eq!(env_config(&[("COLLECTOR_LOGS__MULTILINE__MODE", "off")]).unwrap_err(), "logs.multiline was removed in 0.4.0; see CHANGELOG");
     }
 
     #[test]

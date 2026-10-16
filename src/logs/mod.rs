@@ -4,17 +4,15 @@ pub mod jsonfile;
 pub mod sink;
 
 use crate::config::{Config, StartAt};
-use crate::containers::docker::Docker;
-use crate::containers::{rfc3339_nanos, Container, Registry};
+use crate::containers::{Container, Registry};
 use crate::metrics::MetricSet;
 use crate::util::{self, log, shutdown};
-use assemble::{Assembler, Piece, Record, Rules};
-use cursor::{ApiSaved, Cursor, Saved, Start, State};
+use assemble::{Assembler, Piece};
+use cursor::{Cursor, Start, State, Tail};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,7 +25,6 @@ pub struct Stats {
     pub unparsed: AtomicU64,
     pub lost_rotations: AtomicU64,
     pub followed: AtomicU64,
-    pub followed_api: AtomicU64,
     pub unsupported: AtomicU64,
     pub last_success: AtomicU64,
     /// Set once the shipper has flushed and saved its cursors after a shutdown request.
@@ -42,68 +39,54 @@ impl Stats {
         m.counter("collector_log_batches_total", "Log batches delivered.", &[], g(&self.batches));
         m.counter("collector_log_send_errors_total", "Failed log batch sends; each is retried.", &[], g(&self.errors));
         m.counter("collector_log_lines_unparsed_total", "Log file lines that were not valid json-file entries.", &[], g(&self.unparsed));
-        m.counter("collector_log_rotations_missed_total", "Times a cursor's file rotated away before it was read.", &[], g(&self.lost_rotations));
+        m.counter("collector_log_rotations_missed_total", "Log files that rotated away before they were read.", &[], g(&self.lost_rotations));
         m.gauge("collector_log_containers_followed", "Containers whose log files are followed.", &[], g(&self.followed));
-        m.gauge("collector_log_containers_followed_api", "Containers followed through the Docker logs API (local, journald).", &[], g(&self.followed_api));
-        m.gauge("collector_log_containers_unsupported", "Running containers whose log driver can't be read.", &[], g(&self.unsupported));
+        m.gauge("collector_log_containers_unsupported", "Running containers whose log driver isn't json-file.", &[], g(&self.unsupported));
         m.gauge("collector_log_last_success_timestamp_seconds", "Time of the last delivered batch.", &[], g(&self.last_success));
     }
-}
-
-/// One message from a Docker logs API follower.
-struct ApiLine {
-    id: String,
-    stream: &'static str,
-    time: String,
-    ns: u64,
-    text: String,
-}
-
-enum Source {
-    File { path: PathBuf, read: Cursor, replay: Option<Cursor>, asm: Assembler<Cursor> },
-    Api { last_ns: u64, replay_ns: Option<u64>, asm: Assembler<u64>, stop: Arc<AtomicBool> },
 }
 
 struct Tracked {
     meta: Arc<Container>,
     tenant: u32,
-    source: Source,
+    tail: Tail,
+    asm: Assembler<Cursor>,
     gone: bool,
+    /// Gone, and everything it wrote was delivered.
+    done: bool,
 }
 
-/// One flush's records, grouped by tenant.
-#[derive(Default)]
+/// One tenant's next request. Once a send fails it's retried as is, and that tenant's containers aren't read meanwhile.
 struct Batch {
-    tenants: std::collections::BTreeMap<u32, (Vec<u8>, usize)>,
-    bytes: usize,
+    body: Vec<u8>,
     lines: usize,
+    /// Cursors saved once the sink accepts `body`.
+    commits: Vec<(String, Cursor)>,
+    retry_at: Option<Instant>,
+    backoff: Duration,
 }
 
 impl Batch {
-    fn push(&mut self, tenant: u32, rec: &[u8]) {
-        let (body, lines) = self.tenants.entry(tenant).or_default();
-        body.extend_from_slice(rec);
-        body.push(b'\n');
-        *lines += 1;
-        self.bytes += rec.len() + 1;
+    fn new() -> Self {
+        Self { body: Vec::new(), lines: 0, commits: Vec::new(), retry_at: None, backoff: Duration::from_millis(500) }
+    }
+
+    fn push(&mut self, rec: &[u8]) {
+        self.body.extend_from_slice(rec);
+        self.body.push(b'\n');
         self.lines += 1;
     }
 
-    fn is_empty(&self) -> bool {
-        self.lines == 0
+    fn commit(&mut self, id: &str, at: Cursor) {
+        match self.commits.iter_mut().find(|(i, _)| i == id) {
+            Some(c) => c.1 = at,
+            None => self.commits.push((id.to_string(), at)),
+        }
     }
-}
 
-#[derive(Clone, Copy, PartialEq)]
-enum Commit {
-    File(Saved),
-    Api(ApiSaved),
-}
-
-enum Driver {
-    File,
-    Api,
-    Unsupported,
+    fn is_empty(&self) -> bool {
+        self.lines == 0 && self.commits.is_empty()
+    }
 }
 
 pub struct Shipper {
@@ -112,12 +95,10 @@ pub struct Shipper {
     containers_dir: PathBuf,
     state_path: PathBuf,
     registry: Registry,
-    docker: Docker,
     stats: Arc<Stats>,
     exclude: Vec<regex_lite::Regex>,
     exclude_label: Option<(String, String)>,
     self_id: Option<String>,
-    rules: Rules,
     shutdown_timeout: Duration,
 }
 
@@ -131,12 +112,10 @@ impl Shipper {
             containers_dir: cfg.paths.docker_containers.clone(),
             state_path: cfg.paths.state_dir.join("log-cursors.json"),
             registry,
-            docker: Docker::new(&cfg.paths.docker_socket),
             stats,
             exclude,
             exclude_label,
             self_id: own_container_id(),
-            rules: Rules::new(&cfg.logs.multiline),
             shutdown_timeout: cfg.shutdown_timeout,
         }
     }
@@ -149,14 +128,6 @@ impl Shipper {
         self.self_id.as_deref().is_some_and(|id| c.id.starts_with(id))
             || self.exclude.iter().any(|r| r.is_match(&c.name))
             || self.exclude_label.as_ref().is_some_and(|(k, v)| c.all_labels.get(k) == Some(v))
-    }
-
-    fn driver(c: &Container) -> Driver {
-        match c.log_driver.as_str() {
-            "json-file" | "" => Driver::File,
-            "local" | "journald" => Driver::Api,
-            _ => Driver::Unsupported,
-        }
     }
 
     fn log_file(&self, c: &Container) -> PathBuf {
@@ -181,9 +152,7 @@ impl Shipper {
             self.stats.stopped.store(true, Ordering::SeqCst);
             return;
         }
-        let loaded = State::load(&self.state_path);
-        let first_run = loaded.is_none();
-        let mut state = loaded.unwrap_or(State { version: 2, ..Default::default() });
+        let (mut state, first_run) = load_state(&self.state_path);
         state.version = 2;
         while !self.registry.synced() {
             if shutdown::sleep(Duration::from_millis(200)) {
@@ -191,31 +160,16 @@ impl Shipper {
                 return;
             }
         }
-        let (tx, rx) = sync_channel::<ApiLine>(self.cfg.api_queue_lines.max(16));
         let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        let mut batches: BTreeMap<u32, Batch> = BTreeMap::new();
         let mut warned: HashSet<String> = HashSet::new();
         let mut first = true;
         let mut rr = 0usize;
         let mut last_prune = Instant::now();
         loop {
-            let stopping = shutdown::requested();
-            if !stopping {
-                self.refresh(&mut tracked, &mut state, &mut warned, &tx, first && first_run);
-                if first {
-                    let _ = state.save(&self.state_path);
-                    first = false;
-                }
-            }
-            let ok = self.drain(&mut *sink, &mut tracked, &mut state, &rx, &mut rr, stopping);
-            let ok = ok && (stopping || !shutdown::requested() || self.drain(&mut *sink, &mut tracked, &mut state, &rx, &mut rr, true));
-            if stopping || shutdown::requested() {
-                if !ok {
+            if shutdown::requested() {
+                if !self.finish(&mut *sink, &mut batches, &mut state) {
                     log::warn!("logs: undelivered lines will be re-read on restart");
-                }
-                for t in tracked.values() {
-                    if let Source::Api { stop, .. } = &t.source {
-                        stop.store(true, Ordering::Relaxed);
-                    }
                 }
                 if let Err(e) = state.save(&self.state_path) {
                     log::warn!("logs: saving cursors: {e}");
@@ -224,16 +178,15 @@ impl Shipper {
                 self.stats.stopped.store(true, Ordering::SeqCst);
                 return;
             }
-            for t in tracked.values().filter(|t| t.gone) {
-                if let Source::Api { stop, .. } = &t.source {
-                    stop.store(true, Ordering::Relaxed);
-                }
+            self.refresh(&mut tracked, &mut state, &mut warned, first && first_run);
+            if first {
+                let _ = state.save(&self.state_path);
+                first = false;
             }
-            tracked.retain(|_, t| !t.gone);
-
+            self.drain(&mut *sink, &mut tracked, &mut batches, &mut state, &mut rr);
+            tracked.retain(|_, t| !t.done);
             if last_prune.elapsed() > Duration::from_secs(600) {
-                state.cursors.retain(|id, _| tracked.contains_key(id) || self.containers_dir.join(id).exists());
-                state.api.retain(|id, _| tracked.contains_key(id));
+                prune(&mut state, &tracked, &self.containers_dir);
                 let _ = state.save(&self.state_path);
                 last_prune = Instant::now();
             }
@@ -241,8 +194,8 @@ impl Shipper {
         }
     }
 
-    /// Updates the follow set from the registry; containers that left get one final drain.
-    fn refresh(&self, tracked: &mut HashMap<String, Tracked>, state: &mut State, warned: &mut HashSet<String>, tx: &SyncSender<ApiLine>, initial: bool) {
+    /// Updates the follow set from the registry; containers that left are read to the end, then dropped.
+    fn refresh(&self, tracked: &mut HashMap<String, Tracked>, state: &mut State, warned: &mut HashSet<String>, initial: bool) {
         for t in tracked.values_mut() {
             t.gone = true;
         }
@@ -251,64 +204,29 @@ impl Shipper {
             if self.excluded(&c) {
                 continue;
             }
-            let tenant = self.tenant(&c, warned);
             if let Some(t) = tracked.get_mut(&c.id) {
                 t.gone = false;
                 t.meta = c;
-                t.tenant = tenant;
                 continue;
             }
-            let skip_history = initial && self.cfg.first_run == StartAt::End;
-            let source = match Self::driver(&c) {
-                Driver::File => {
-                    let path = self.log_file(&c);
-                    let saved = match state.cursors.get(&c.id) {
-                        Some(s) => *s,
-                        None => {
-                            let start = if skip_history { Start::End } else { Start::Beginning };
-                            let Some(cur) = cursor::initial(&path, start) else { continue };
-                            let s = Saved::at(cur);
-                            state.cursors.insert(c.id.clone(), s);
-                            s
-                        }
-                    };
-                    let replay = saved.replay_until.filter(|r| cursor::reachable(&path, *r));
-                    Source::File { path, read: saved.cursor(), replay, asm: Assembler::default() }
+            if !readable(&c) {
+                unsupported += 1;
+                if warned.insert(c.id.clone()) {
+                    log::warn!("logs: {} uses the {} log driver; only json-file is read, so its logs are not shipped", c.name, c.log_driver);
                 }
-                Driver::Api => {
-                    let saved = match state.api.get(&c.id) {
-                        Some(s) => *s,
-                        None => {
-                            let since_ns = if skip_history { util::now_nanos() } else { 0 };
-                            let s = ApiSaved { since_ns, replay_until_ns: None };
-                            state.api.insert(c.id.clone(), s);
-                            s
-                        }
-                    };
-                    let stop = Arc::new(AtomicBool::new(false));
-                    self.spawn_follower(&c, saved.since_ns, stop.clone(), tx.clone());
-                    Source::Api { last_ns: saved.since_ns.saturating_sub(1), replay_ns: saved.replay_until_ns, asm: Assembler::default(), stop }
-                }
-                Driver::Unsupported => {
-                    unsupported += 1;
-                    if warned.insert(c.id.clone()) {
-                        log::warn!("logs: {} uses the {} log driver, which can't be read back; its logs are not shipped", c.name, c.log_driver);
-                    }
-                    continue;
-                }
-            };
-            tracked.insert(c.id.clone(), Tracked { meta: c, tenant, source, gone: false });
-        }
-        let live = tracked.values().filter(|t| !t.gone);
-        let (mut files, mut api) = (0, 0);
-        for t in live {
-            match t.source {
-                Source::File { .. } => files += 1,
-                Source::Api { .. } => api += 1,
+                continue;
             }
+            let start = if initial && self.cfg.first_run == StartAt::End { Start::End } else { Start::Beginning };
+            let Some((tail, lost)) = Tail::open(&self.log_file(&c), state.cursors.get(&c.id).copied(), start) else { continue };
+            if lost {
+                self.stats.lost_rotations.fetch_add(1, Ordering::Relaxed);
+                log::warn!("logs: {} rotated past its saved cursor; some lines were not shipped", c.name);
+            }
+            state.cursors.entry(c.id.clone()).or_insert(tail.cursor);
+            let tenant = self.tenant(&c, warned);
+            tracked.insert(c.id.clone(), Tracked { meta: c, tenant, tail, asm: Assembler::default(), gone: false, done: false });
         }
-        self.stats.followed.store(files, Ordering::Relaxed);
-        self.stats.followed_api.store(api, Ordering::Relaxed);
+        self.stats.followed.store(tracked.values().filter(|t| !t.gone).count() as u64, Ordering::Relaxed);
         self.stats.unsupported.store(unsupported, Ordering::Relaxed);
     }
 
@@ -326,185 +244,120 @@ impl Shipper {
         })
     }
 
-    fn spawn_follower(&self, c: &Container, since_ns: u64, stop: Arc<AtomicBool>, tx: SyncSender<ApiLine>) {
-        let docker = self.docker.clone();
-        let (id, name, tty) = (c.id.clone(), c.name.clone(), c.tty);
-        let spawned = std::thread::Builder::new().name(format!("logs-api-{}", &id[..12.min(id.len())])).spawn(move || {
-            let mut since = since_ns;
-            let mut backoff = Duration::from_secs(1);
-            while !stop.load(Ordering::Relaxed) {
-                let res = docker.follow_logs(&id, since, tty, &stop, |stream, payload| {
-                    let text = String::from_utf8_lossy(payload);
-                    let (time, body) = text.split_once(' ').unwrap_or((&text, ""));
-                    let Some(ns) = rfc3339_nanos(time) else { return true };
-                    since = ns + 1;
-                    let line = ApiLine { id: id.clone(), stream, time: time.to_string(), ns, text: body.to_string() };
-                    tx.send(line).is_ok() && !stop.load(Ordering::Relaxed)
-                });
-                if let Err(e) = res {
-                    log::debug!("logs: {name}: {e}");
-                }
-                if shutdown::sleep(backoff) {
-                    return;
-                }
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-            }
-        });
-        if let Err(e) = spawned {
-            log::warn!("logs: {}: {e}", c.name);
-        }
-    }
-
-    /// Ships batches until every source is caught up. When stopping, flushes groups and stops reading.
-    /// Returns false when a batch was abandoned at shutdown; in-memory positions are then ahead of what was delivered.
-    fn drain(&self, sink: &mut dyn sink::Sink, tracked: &mut HashMap<String, Tracked>, state: &mut State, rx: &Receiver<ApiLine>, rr: &mut usize, stopping: bool) -> bool {
+    /// Reads and sends, one request per tenant per round, until caught up or every tenant with data is waiting to retry.
+    fn drain(&self, sink: &mut dyn sink::Sink, tracked: &mut HashMap<String, Tracked>, batches: &mut BTreeMap<u32, Batch>, state: &mut State, rr: &mut usize) {
         let mut ids: Vec<String> = tracked.keys().cloned().collect();
         ids.sort();
+        let n = ids.len();
+        loop {
+            let mut more = false;
+            let mut resume = None;
+            for k in 0..n {
+                let i = (*rr + k) % n;
+                let t = tracked.get_mut(&ids[i]).unwrap();
+                let b = batches.entry(t.tenant).or_insert_with(Batch::new);
+                if b.retry_at.is_some() {
+                    continue;
+                }
+                if b.body.len() >= self.cfg.batch_bytes || b.lines >= self.cfg.batch_lines {
+                    resume.get_or_insert(i);
+                    more = true;
+                    continue;
+                }
+                more |= self.read(&ids[i], t, b);
+            }
+            *rr = resume.unwrap_or(*rr);
+            let retried = self.send_due(sink, batches, state);
+            if !(more || retried) || shutdown::requested() {
+                return;
+            }
+        }
+    }
+
+    /// Reads one chunk of a container into its tenant's batch; true when more is waiting.
+    fn read(&self, id: &str, t: &mut Tracked, b: &mut Batch) -> bool {
+        let chunk = t.tail.read(self.cfg.read_bytes);
+        if chunk.lost > 0 {
+            self.stats.lost_rotations.fetch_add(chunk.lost, Ordering::Relaxed);
+            log::warn!("logs: {} rotated {} file(s) away before they were read; their lines were not shipped", t.meta.name, chunk.lost);
+        }
+        let mut recs = Vec::new();
+        for l in &chunk.lines {
+            let Some(parsed) = jsonfile::parse_line(chunk.line(l)) else {
+                self.stats.unparsed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            t.asm.push(Piece { stream: &parsed.stream, time: &parsed.time, text: &parsed.log, start: l.start, end: l.end }, &mut recs);
+        }
+        if t.gone && chunk.eof {
+            if chunk.lines.is_empty() && t.asm.oldest_start().is_none() {
+                t.done = true;
+            }
+            t.asm.flush(&mut recs);
+        }
+        for r in &recs {
+            if let Some(rec) = self.encode(&t.meta, &r.stream, &r.time, &r.msg) {
+                b.push(&rec);
+            }
+        }
+        if !chunk.lines.is_empty() || !recs.is_empty() {
+            b.commit(id, t.asm.oldest_start().unwrap_or(t.tail.cursor));
+        }
+        !chunk.eof
+    }
+
+    /// Sends each tenant's batch that's due once; delivered batches commit their cursors. True when a retried batch got through.
+    fn send_due(&self, sink: &mut dyn sink::Sink, batches: &mut BTreeMap<u32, Batch>, state: &mut State) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+        let mut retried = false;
+        for (tenant, b) in batches.iter_mut() {
+            if b.is_empty() || b.retry_at.is_some_and(|r| r > now) {
+                continue;
+            }
+            if b.lines > 0 {
+                let account = (!self.cfg.tenant_label.is_empty()).then_some(*tenant);
+                if let Err(e) = sink.send(&b.body, account) {
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    let who = account.map(|t| format!("tenant {t}: ")).unwrap_or_default();
+                    log::warn!("logs: {who}{e}; retrying in {:.1}s", b.backoff.as_secs_f64());
+                    b.retry_at = Some(now + b.backoff);
+                    b.backoff = (b.backoff * 2).min(self.cfg.max_backoff);
+                    continue;
+                }
+                self.stats.lines.fetch_add(b.lines as u64, Ordering::Relaxed);
+                self.stats.bytes.fetch_add(b.body.len() as u64, Ordering::Relaxed);
+                self.stats.batches.fetch_add(1, Ordering::Relaxed);
+                self.stats.last_success.store(util::now_secs() as u64, Ordering::Relaxed);
+            }
+            for (id, c) in b.commits.drain(..) {
+                changed |= state.cursors.insert(id, c) != Some(c);
+            }
+            retried |= b.retry_at.is_some();
+            *b = Batch::new();
+        }
+        batches.retain(|_, b| !b.is_empty());
+        if changed {
+            if let Err(e) = state.save(&self.state_path) {
+                log::warn!("logs: saving cursors: {e}");
+            }
+        }
+        retried
+    }
+
+    /// Retries undelivered batches until they're delivered or `shutdown_timeout` passes.
+    fn finish(&self, sink: &mut dyn sink::Sink, batches: &mut BTreeMap<u32, Batch>, state: &mut State) -> bool {
         let deadline = Instant::now() + self.shutdown_timeout;
         loop {
-            let mut batch = Batch::default();
-            let mut full = false;
-            let mut recs = Vec::new();
-            let mut api_recs = Vec::new();
-            let limit = |b: &Batch| b.bytes >= self.cfg.batch_bytes || b.lines >= self.cfg.batch_lines;
-
-            if !stopping {
-                while !full {
-                    let Ok(l) = rx.try_recv() else { break };
-                    let Some(t) = tracked.get_mut(&l.id) else { continue };
-                    if let Source::Api { last_ns, replay_ns, asm, .. } = &mut t.source {
-                        if l.ns <= *last_ns {
-                            continue;
-                        }
-                        let replaying = replay_ns.is_some_and(|r| l.ns <= r);
-                        asm.push(&self.rules, Piece { stream: l.stream, time: &l.time, text: &l.text, start: l.ns, end: l.ns }, &mut api_recs);
-                        *last_ns = l.ns;
-                        if replaying {
-                            api_recs.clear();
-                        } else {
-                            *replay_ns = None;
-                        }
-                        for r in api_recs.drain(..) {
-                            self.append(&mut batch, t.tenant, &t.meta, &r.stream, &r.time, &r.msg);
-                        }
-                        full = limit(&batch);
-                    }
-                }
-
-                let n = ids.len();
-                for k in 0..n {
-                    if full {
-                        break;
-                    }
-                    let id = &ids[(*rr + k) % n];
-                    let t = tracked.get_mut(id).unwrap();
-                    let Source::File { path, read, replay, asm } = &mut t.source else { continue };
-                    let Some(chunk) = cursor::read_from(path, *read, self.cfg.read_bytes) else { continue };
-                    if chunk.lost {
-                        self.stats.lost_rotations.fetch_add(1, Ordering::Relaxed);
-                        *replay = None;
-                        log::warn!("logs: {} rotated past its cursor; some lines were not shipped", t.meta.name);
-                    }
-                    for l in &chunk.lines {
-                        let Some(parsed) = jsonfile::parse_line(chunk.line(l)) else {
-                            self.stats.unparsed.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        };
-                        asm.push(&self.rules, Piece { stream: &parsed.stream, time: &parsed.time, text: &parsed.log, start: l.start, end: l.end }, &mut recs);
-                        if let Some(r) = *replay {
-                            recs.clear();
-                            if l.end.inode == r.inode && l.end.offset >= r.offset {
-                                *replay = None;
-                            }
-                        }
-                        for r in recs.drain(..) {
-                            self.append(&mut batch, t.tenant, &t.meta, &r.stream, &r.time, &r.msg);
-                        }
-                    }
-                    *read = chunk.cursor;
-                    if limit(&batch) {
-                        full = true;
-                        *rr = (*rr + k + 1) % n;
-                    }
-                }
-            }
-
-            // Idle multi-line groups, gone containers and shutdown flushes.
-            for t in tracked.values_mut() {
-                let mut out: Vec<Record<()>> = Vec::new();
-                match &mut t.source {
-                    Source::File { replay: None, asm, .. } => collect(asm, &self.rules, t.gone, stopping, &mut out),
-                    Source::Api { replay_ns: None, asm, .. } => collect(asm, &self.rules, t.gone, stopping, &mut out),
-                    _ => {}
-                }
-                for r in out {
-                    self.append(&mut batch, t.tenant, &t.meta, &r.stream, &r.time, &r.msg);
-                }
-            }
-
-            let commits: Vec<(String, Commit)> = tracked.iter().filter_map(|(id, t)| commit_for(t).map(|c| (id.clone(), c))).filter(|(id, c)| !same(state, id, c)).collect();
-            let delivered = batch.is_empty() || self.send_all(sink, &batch, stopping.then_some(deadline));
-            if !delivered {
-                return false;
-            }
-            if !commits.is_empty() {
-                for (id, c) in commits {
-                    match c {
-                        Commit::File(s) => {
-                            state.cursors.insert(id, s);
-                        }
-                        Commit::Api(s) => {
-                            state.api.insert(id, s);
-                        }
-                    }
-                }
-                if let Err(e) = state.save(&self.state_path) {
-                    log::warn!("logs: saving cursors: {e}");
-                }
-            }
-            if !full || stopping {
+            self.send_due(sink, batches, state);
+            if batches.is_empty() {
                 return true;
             }
-        }
-    }
-
-    /// Sends each tenant's records as its own request; cursors move only once all are delivered.
-    fn send_all(&self, sink: &mut dyn sink::Sink, batch: &Batch, deadline: Option<Instant>) -> bool {
-        let tenant = |t: u32| (!self.cfg.tenant_label.is_empty()).then_some(t);
-        batch.tenants.iter().all(|(t, (body, lines))| self.send(sink, body, *lines, tenant(*t), deadline))
-    }
-
-    /// Retries until the sink accepts the batch; the log files are the buffer. Gives up only past `deadline`.
-    fn send(&self, sink: &mut dyn sink::Sink, batch: &[u8], lines: usize, tenant: Option<u32>, mut deadline: Option<Instant>) -> bool {
-        let mut backoff = Duration::from_millis(500);
-        loop {
-            match sink.send(batch, tenant) {
-                Ok(()) => {
-                    self.stats.lines.fetch_add(lines as u64, Ordering::Relaxed);
-                    self.stats.bytes.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                    self.stats.batches.fetch_add(1, Ordering::Relaxed);
-                    self.stats.last_success.store(util::now_secs() as u64, Ordering::Relaxed);
-                    return true;
-                }
-                Err(e) => {
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    if deadline.is_some_and(|d| Instant::now() + backoff > d) {
-                        log::warn!("logs: {e}; giving up for shutdown, unsent lines stay on disk");
-                        return false;
-                    }
-                    log::warn!("logs: {e}; retrying in {:.1}s", backoff.as_secs_f64());
-                    if shutdown::sleep(backoff) && deadline.is_none() {
-                        deadline = Some(Instant::now() + self.shutdown_timeout);
-                    }
-                    backoff = (backoff * 2).min(self.cfg.max_backoff);
-                }
+            let next = batches.values().filter_map(|b| b.retry_at).min().unwrap_or(deadline);
+            if next >= deadline {
+                return false;
             }
-        }
-    }
-
-    fn append(&self, batch: &mut Batch, tenant: u32, c: &Container, stream: &str, time: &str, msg: &str) {
-        if let Some(rec) = self.encode(c, stream, time, msg) {
-            batch.push(tenant, &rec);
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -548,41 +401,30 @@ impl Shipper {
     }
 }
 
-/// Moves records due for emission out of an assembler, position-free.
-fn collect<P: Copy>(asm: &mut Assembler<P>, rules: &Rules, gone: bool, stopping: bool, out: &mut Vec<Record<()>>) {
-    let mut recs = Vec::new();
-    if gone {
-        asm.flush_all(&mut recs);
-    } else if stopping {
-        asm.flush_groups(&mut recs);
-    } else {
-        asm.flush_idle(rules, &mut recs);
-    }
-    out.extend(recs.into_iter().map(|r| Record { stream: r.stream, time: r.time, msg: r.msg, start: (), end: () }));
+fn readable(c: &Container) -> bool {
+    matches!(c.log_driver.as_str(), "json-file" | "")
 }
 
-/// The cursor to persist once the current batch is delivered.
-fn commit_for(t: &Tracked) -> Option<Commit> {
-    match &t.source {
-        Source::File { replay: Some(_), .. } | Source::Api { replay_ns: Some(_), .. } => None,
-        Source::File { read, asm, .. } => {
-            let start = asm.oldest_start().unwrap_or(*read);
-            let replay_until = (!asm.is_empty()).then_some(*read);
-            Some(Commit::File(Saved { inode: start.inode, offset: start.offset, replay_until }))
-        }
-        Source::Api { last_ns, asm, .. } => {
-            let since_ns = asm.oldest_start().unwrap_or(last_ns + 1);
-            let replay_until_ns = (!asm.is_empty()).then_some(*last_ns);
-            Some(Commit::Api(ApiSaved { since_ns, replay_until_ns }))
+/// The saved cursors and whether this is a first run. An unreadable file is kept aside and every container reads from its oldest file.
+fn load_state(path: &Path) -> (State, bool) {
+    match State::load(path) {
+        Ok(Some(s)) => (s, false),
+        Ok(None) => (State::default(), true),
+        Err(e) => {
+            let bad = path.with_extension(format!("json.bad-{}", util::now_secs() as u64));
+            let kept = match std::fs::rename(path, &bad) {
+                Ok(()) => format!("kept as {}", bad.display()),
+                Err(re) => format!("could not keep it: {re}"),
+            };
+            log::error!("logs: {} is unreadable ({e}); {kept}; re-reading every container's logs from its oldest file", path.display());
+            (State::default(), false)
         }
     }
 }
 
-fn same(state: &State, id: &str, c: &Commit) -> bool {
-    match c {
-        Commit::File(s) => state.cursors.get(id) == Some(s),
-        Commit::Api(s) => state.api.get(id) == Some(s),
-    }
+/// Drops cursors of containers that are neither followed nor still have a log dir.
+fn prune(state: &mut State, tracked: &HashMap<String, Tracked>, containers_dir: &Path) {
+    state.cursors.retain(|id, _| tracked.contains_key(id) || containers_dir.join(id).exists());
 }
 
 /// The collector's own container id, from /proc/self/mountinfo, so it never ships its own logs.
@@ -602,7 +444,7 @@ fn own_container_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
 
     fn shipper() -> Shipper {
         let cfg = Config { host: "web-1".into(), ..Default::default() };
@@ -642,61 +484,192 @@ mod tests {
         assert_eq!(f["team"], "a");
     }
 
+    #[test]
+    fn only_json_file_is_readable() {
+        for (driver, ok) in [("json-file", true), ("", true), ("local", false), ("journald", false), ("syslog", false)] {
+            assert_eq!(readable(&Container { log_driver: driver.into(), ..Default::default() }), ok, "{driver}");
+        }
+    }
+
     type Sent = Vec<(Option<u32>, Vec<String>)>;
 
-    struct Recorder(Arc<std::sync::Mutex<Sent>>);
+    /// Records each request's tenant and messages; fails every request for `fail`.
+    struct Recorder {
+        sent: Arc<Mutex<Sent>>,
+        fail: Option<u32>,
+    }
 
     impl sink::Sink for Recorder {
         fn send(&mut self, body: &[u8], tenant: Option<u32>) -> Result<(), String> {
-            let names = String::from_utf8_lossy(body).lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["container"].as_str().unwrap().to_string()).collect();
-            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((tenant, names));
+            if Some(tenant.unwrap_or(0)) == self.fail {
+                return Err("HTTP 400".into());
+            }
+            let msgs = String::from_utf8_lossy(body).lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["_msg"].as_str().unwrap().to_string()).collect();
+            self.sent.lock().unwrap_or_else(PoisonError::into_inner).push((tenant, msgs));
             Ok(())
         }
     }
 
-    /// Drains one flush of json-file logs for containers labeled with `tenants` and returns each request's tenant and container names.
-    fn flush(tenant_label: &str, tenants: &[(&str, Option<&str>)]) -> Sent {
-        let root = std::env::temp_dir().join(format!("collector-tenants-{}-{}", std::process::id(), tenant_label.len()));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut cfg = Config { host: "web-1".into(), ..Default::default() };
-        cfg.paths.state_dir = root.join("state");
-        cfg.logs.tenant_label = tenant_label.into();
-        std::fs::create_dir_all(&cfg.paths.state_dir).unwrap();
-        let shipper = Shipper::new(&cfg, Registry::new(), Arc::new(Stats::default()));
-        let mut tracked = HashMap::new();
-        let mut warned = HashSet::new();
+    struct Rig {
+        root: PathBuf,
+        shipper: Shipper,
+        tracked: HashMap<String, Tracked>,
+        batches: BTreeMap<u32, Batch>,
+        state: State,
+        sent: Arc<Mutex<Sent>>,
+    }
+
+    fn line(stream: &str, text: &str) -> String {
+        format!("{}\n", serde_json::json!({"log": text, "stream": stream, "time": "2026-10-10T12:00:00Z"}))
+    }
+
+    impl Rig {
+        fn new(name: &str, tenant_label: &str) -> Rig {
+            let root = std::env::temp_dir().join(format!("collector-logs-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let mut cfg = Config { host: "web-1".into(), ..Default::default() };
+            cfg.paths.state_dir = root.join("state");
+            cfg.paths.docker_containers = root.clone();
+            cfg.logs.tenant_label = tenant_label.into();
+            std::fs::create_dir_all(&cfg.paths.state_dir).unwrap();
+            let shipper = Shipper::new(&cfg, Registry::new(), Arc::new(Stats::default()));
+            Rig { root, shipper, tracked: HashMap::new(), batches: BTreeMap::new(), state: State::default(), sent: Arc::default() }
+        }
+
+        fn path(&self, id: &str) -> PathBuf {
+            self.root.join(format!("{id}-json.log"))
+        }
+
+        fn write(&self, id: &str, lines: &[(&str, &str)]) {
+            let text: String = lines.iter().map(|(s, t)| line(s, t)).collect();
+            std::fs::OpenOptions::new().create(true).append(true).open(self.path(id)).unwrap().write_all(text.as_bytes()).unwrap();
+        }
+
+        /// Follows `id` from its saved cursor, as after a restart.
+        fn follow(&mut self, id: &str, name: &str, tenant: Option<&str>) {
+            let all_labels = tenant.iter().map(|v| ("com.example.tenant".to_string(), v.to_string())).collect();
+            let c = Container { id: id.into(), name: name.into(), all_labels, ..Default::default() };
+            let (tail, _) = Tail::open(&self.path(id), self.state.cursors.get(id).copied(), Start::Beginning).unwrap();
+            let tenant = self.shipper.tenant(&c, &mut HashSet::new());
+            self.tracked.insert(id.into(), Tracked { meta: Arc::new(c), tenant, tail, asm: Assembler::default(), gone: false, done: false });
+        }
+
+        fn drain(&mut self, fail: Option<u32>) -> Sent {
+            let mut sink = Recorder { sent: self.sent.clone(), fail };
+            self.shipper.drain(&mut sink, &mut self.tracked, &mut self.batches, &mut self.state, &mut 0);
+            std::mem::take(&mut *self.sent.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    use std::io::Write;
+
+    fn tenants_rig(name: &str, tenant_label: &str, tenants: &[(&str, Option<&str>)]) -> Rig {
+        let mut rig = Rig::new(name, tenant_label);
         for (i, (name, label)) in tenants.iter().enumerate() {
             let id = format!("{i:x}").repeat(64);
-            let path = root.join(format!("{id}-json.log"));
-            std::fs::write(&path, format!("{{\"log\":\"hello from {name}\\n\",\"stream\":\"stdout\",\"time\":\"2026-10-10T12:00:00.{i}Z\"}}\n")).unwrap();
-            let all_labels = label.iter().map(|v| ("com.example.tenant".to_string(), v.to_string())).collect();
-            let c = Container { id: id.clone(), name: name.to_string(), all_labels, ..Default::default() };
-            let read = cursor::initial(&path, Start::Beginning).unwrap();
-            let tenant = shipper.tenant(&c, &mut warned);
-            tracked.insert(id, Tracked { meta: Arc::new(c), tenant, source: Source::File { path, read, replay: None, asm: Assembler::default() }, gone: false });
+            rig.write(&id, &[("stdout", &format!("hello from {name}\n"))]);
+            rig.follow(&id, name, *label);
         }
-        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (_tx, rx) = sync_channel::<ApiLine>(1);
-        let ok = shipper.drain(&mut Recorder(sent.clone()), &mut tracked, &mut State::default(), &rx, &mut 0, false);
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(ok);
-        let mut out = sent.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        for (_, names) in &mut out {
-            names.sort();
-        }
-        out
+        rig
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
     fn one_request_per_tenant_per_flush() {
-        let got = flush("com.example.tenant", &[("a", Some("7")), ("b", Some("3")), ("c", None), ("d", Some("7")), ("e", Some("x"))]);
-        let want = vec![(Some(0), vec!["c".to_string(), "e".to_string()]), (Some(3), vec!["b".to_string()]), (Some(7), vec!["a".to_string(), "d".to_string()])];
-        assert_eq!(got, want);
+        let mut rig = tenants_rig("tenants", "com.example.tenant", &[("a", Some("7")), ("b", Some("3")), ("c", None), ("d", Some("7")), ("e", Some("x"))]);
+        let want = vec![
+            (Some(0), strs(&["hello from c", "hello from e"])),
+            (Some(3), strs(&["hello from b"])),
+            (Some(7), strs(&["hello from a", "hello from d"])),
+        ];
+        assert_eq!(rig.drain(None), want);
     }
 
     #[test]
     fn without_tenant_label_one_request_without_account_id() {
-        let got = flush("", &[("a", Some("7")), ("b", None)]);
-        assert_eq!(got, vec![(None, vec!["a".to_string(), "b".to_string()])]);
+        let mut rig = tenants_rig("no-tenant", "", &[("a", Some("7")), ("b", None)]);
+        assert_eq!(rig.drain(None), vec![(None, strs(&["hello from a", "hello from b"]))]);
+    }
+
+    #[test]
+    fn a_failing_tenant_holds_back_only_its_own_containers() {
+        let mut rig = tenants_rig("failing", "com.example.tenant", &[("a", Some("7")), ("b", Some("3")), ("c", None)]);
+        let ids: Vec<String> = (0..3).map(|i| format!("{i:x}").repeat(64)).collect();
+        assert_eq!(rig.drain(Some(3)), vec![(Some(0), strs(&["hello from c"])), (Some(7), strs(&["hello from a"]))]);
+        assert_eq!(rig.state.cursors[&ids[0]].offset, std::fs::metadata(rig.path(&ids[0])).unwrap().len());
+        assert!(!rig.state.cursors.contains_key(&ids[1]));
+        rig.write(&ids[0], &[("stdout", "more from a\n")]);
+        rig.write(&ids[1], &[("stdout", "more from b\n")]);
+        assert_eq!(rig.drain(Some(3)), vec![(Some(7), strs(&["more from a"]))]);
+        rig.batches.get_mut(&3).unwrap().retry_at = Some(Instant::now());
+        assert_eq!(rig.drain(None), vec![(Some(3), strs(&["hello from b"])), (Some(3), strs(&["more from b"]))]);
+        assert_eq!(rig.state.cursors[&ids[1]].offset, std::fs::metadata(rig.path(&ids[1])).unwrap().len());
+    }
+
+    #[test]
+    fn partial_lines_are_delivered_once_across_a_restart() {
+        let mut rig = Rig::new("partial", "");
+        let id = "c".repeat(64);
+        rig.write(&id, &[("stdout", "first\n"), ("stdout", "big-1 "), ("stderr", "err-1\n"), ("stdout", "big-2 ")]);
+        rig.follow(&id, "app", None);
+        assert_eq!(rig.drain(None), vec![(None, strs(&["first"]))]);
+        rig.write(&id, &[("stdout", "big-3\n"), ("stderr", "err-2\n")]);
+        rig.tracked.clear();
+        rig.follow(&id, "app", None);
+        assert_eq!(rig.drain(None), vec![(None, strs(&["big-1 big-2 big-3", "err-1", "err-2"]))]);
+        rig.tracked.clear();
+        rig.follow(&id, "app", None);
+        assert_eq!(rig.drain(None), vec![]);
+    }
+
+    #[test]
+    fn gone_containers_flush_held_pieces_and_are_dropped_once_delivered() {
+        let mut rig = Rig::new("gone", "");
+        let id = "d".repeat(64);
+        rig.write(&id, &[("stdout", "unfinished")]);
+        rig.follow(&id, "app", None);
+        assert_eq!(rig.drain(None), vec![]);
+        rig.tracked.get_mut(&id).unwrap().gone = true;
+        assert_eq!(rig.drain(Some(0)), vec![]);
+        assert!(!rig.tracked[&id].done);
+        rig.batches.get_mut(&0).unwrap().retry_at = Some(Instant::now());
+        assert_eq!(rig.drain(None), vec![(None, strs(&["unfinished"]))]);
+        assert!(rig.tracked[&id].done);
+    }
+
+    #[test]
+    fn unreadable_state_is_kept_aside_and_not_a_first_run() {
+        let rig = Rig::new("state", "");
+        let p = rig.root.join("log-cursors.json");
+        assert!(load_state(&p).1);
+        std::fs::write(&p, "{\"version\":2,\"cur").unwrap();
+        let (state, first_run) = load_state(&p);
+        assert!(!first_run);
+        assert!(state.cursors.is_empty());
+        let kept: Vec<_> = std::fs::read_dir(&rig.root).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("log-cursors.json.bad-")).collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read_to_string(kept[0].path()).unwrap(), "{\"version\":2,\"cur");
+    }
+
+    #[test]
+    fn prune_keeps_cursors_while_the_log_dir_exists() {
+        let rig = Rig::new("prune", "");
+        let (stopped, removed) = ("e".repeat(64), "f".repeat(64));
+        std::fs::create_dir_all(rig.root.join(&stopped)).unwrap();
+        let mut state = State::default();
+        for id in [&stopped, &removed] {
+            state.cursors.insert(id.clone(), Cursor { inode: 1, offset: 1 });
+        }
+        prune(&mut state, &HashMap::new(), &rig.root);
+        assert_eq!(state.cursors.keys().collect::<Vec<_>>(), [&stopped]);
     }
 }

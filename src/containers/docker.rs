@@ -104,8 +104,6 @@ pub struct LogConfig {
 pub struct ContainerConfig {
     #[serde(rename = "Image", default)]
     pub image: String,
-    #[serde(rename = "Tty", default)]
-    pub tty: bool,
     #[serde(rename = "Labels", default)]
     pub labels: Option<BTreeMap<String, String>>,
 }
@@ -191,31 +189,6 @@ impl Docker {
         self.get_json(&format!("/containers/{id}/json"))
     }
 
-    /// Follows a container's log through the API, calling `f(stream, payload)` per message until the stream ends.
-    pub fn follow_logs(&self, id: &str, since_ns: u64, tty: bool, stop: &std::sync::atomic::AtomicBool, mut f: impl FnMut(&'static str, &[u8]) -> bool) -> Result<(), String> {
-        let since = format!("{}.{:09}", since_ns / 1_000_000_000, since_ns % 1_000_000_000);
-        let path = format!("/containers/{id}/logs?follow=1&stdout=1&stderr=1&timestamps=1&since={since}");
-        let mut res = self.open(&path, None).map_err(|e| format!("docker logs: {e}"))?;
-        if res.status != 200 {
-            return Err(format!("docker logs: HTTP {}", res.status));
-        }
-        loop {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(());
-            }
-            let frame = if tty { read_line_frame(&mut res.body) } else { read_mux_frame(&mut res.body) };
-            match frame {
-                Ok(Some((stream, payload))) => {
-                    if !f(stream, &payload) {
-                        return Ok(());
-                    }
-                }
-                Ok(None) => return Ok(()),
-                Err(e) => return Err(format!("docker logs: {e}")),
-            }
-        }
-    }
-
     /// Streams container events to `f` until the connection drops, replaying from `since_ns` when set and advancing it.
     pub fn events(&self, since_ns: &mut u64, mut f: impl FnMut(Event)) -> Result<(), String> {
         let mut path = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D".to_string();
@@ -239,30 +212,6 @@ impl Docker {
         }
         Err("docker events: stream ended".into())
     }
-}
-
-/// Reads one frame of Docker's multiplexed stream: 1 byte stream type, 3 zero bytes, u32 big-endian length.
-pub fn read_mux_frame(r: &mut impl Read) -> std::io::Result<Option<(&'static str, Vec<u8>)>> {
-    let mut head = [0u8; 8];
-    match r.read_exact(&mut head) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let stream = if head[0] == 2 { "stderr" } else { "stdout" };
-    let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload)?;
-    Ok(Some((stream, payload)))
-}
-
-/// TTY containers have no framing; every line is stdout.
-fn read_line_frame(r: &mut impl BufRead) -> std::io::Result<Option<(&'static str, Vec<u8>)>> {
-    let mut buf = Vec::new();
-    if r.read_until(b'\n', &mut buf)? == 0 {
-        return Ok(None);
-    }
-    Ok(Some(("stdout", buf)))
 }
 
 fn read_head(r: &mut impl BufRead) -> std::io::Result<(u16, Vec<(String, String)>)> {
@@ -425,18 +374,6 @@ mod tests {
         let mut s = String::new();
         c.read_to_string(&mut s).unwrap();
         assert_eq!(s, "hello, world");
-    }
-
-    #[test]
-    fn reads_mux_frames() {
-        let mut raw = vec![1, 0, 0, 0, 0, 0, 0, 3];
-        raw.extend_from_slice(b"hi\n");
-        raw.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 4]);
-        raw.extend_from_slice(b"oops");
-        let mut r = &raw[..];
-        assert_eq!(read_mux_frame(&mut r).unwrap(), Some(("stdout", b"hi\n".to_vec())));
-        assert_eq!(read_mux_frame(&mut r).unwrap(), Some(("stderr", b"oops".to_vec())));
-        assert_eq!(read_mux_frame(&mut r).unwrap(), None);
     }
 
     #[test]

@@ -79,19 +79,8 @@ max_backoff = "30s"
 timeout = "10s"
 parse_level = true
 promote_fields = []
-# Lines buffered from Docker logs API followers (local and journald drivers).
-api_queue_lines = 4096
 # Docker label with a numeric VictoriaLogs AccountID per container; empty sends everything to tenant 0.
 tenant_label = ""
-
-[logs.multiline]
-# off | indent (leading space or tab continues) | continue (pattern continues) | start (pattern starts a record)
-mode = "off"
-pattern = ""
-max_lines = 500
-max_bytes = 262144
-# A group with no new line for this long is sent as is.
-timeout = "2s"
 
 [logs.headers]
 # AccountID = "0"

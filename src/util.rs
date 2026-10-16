@@ -24,10 +24,6 @@ pub fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
-pub fn now_nanos() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
-}
-
 pub fn clk_tck() -> f64 {
     // SAFETY: sysconf has no preconditions.
     let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };

@@ -36,8 +36,6 @@ pub struct Container {
     #[serde(skip)]
     pub log_driver: String,
     #[serde(skip)]
-    pub tty: bool,
-    #[serde(skip)]
     pub cgroup: Option<PathBuf>,
     #[serde(skip)]
     pub metric_labels: LabelSet,
@@ -300,7 +298,6 @@ pub(crate) fn build(i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &conf
         created: i.created,
         log_path: i.log_path,
         log_driver: i.host_config.log_config.kind,
-        tty: i.config.tty,
         cgroup,
         status: i.state.status,
         health: i.state.health.map(|h| h.status).filter(|h| !h.is_empty()),
@@ -670,12 +667,6 @@ pub fn parse_rfc3339(s: &str) -> Option<f64> {
     Some(secs as f64 + nanos as f64 / 1e9)
 }
 
-/// Same, as nanoseconds since the epoch.
-pub fn rfc3339_nanos(s: &str) -> Option<u64> {
-    let (secs, nanos) = rfc3339_parts(s)?;
-    u64::try_from(secs).ok().map(|s| s * 1_000_000_000 + nanos as u64)
-}
-
 fn rfc3339_parts(s: &str) -> Option<(i64, u32)> {
     if s.len() < 20 || s.starts_with("0001-") {
         return None;
@@ -849,9 +840,6 @@ mod tests {
         assert_eq!(parse_rfc3339("2026-10-10T12:00:00.5Z"), Some(1791633600.5));
         assert_eq!(parse_rfc3339("2026-10-10T14:00:00+02:00"), Some(1791633600.0));
         assert_eq!(parse_rfc3339("0001-01-01T00:00:00Z"), None);
-        assert_eq!(rfc3339_nanos("2026-10-10T12:00:00.123456789Z"), Some(1_791_633_600_123_456_789));
-        assert_eq!(rfc3339_nanos("2026-10-10T12:00:00.5Z"), Some(1_791_633_600_500_000_000));
-        assert_eq!(rfc3339_nanos("2026-10-10T12:00:00Z"), Some(1_791_633_600_000_000_000));
     }
 
     #[test]
