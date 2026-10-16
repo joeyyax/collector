@@ -297,11 +297,19 @@ fn metric_labels(c: &Container, cgroup_path: &str, keep: &[String]) -> LabelSet 
     for (k, v) in c.labels.iter().filter(|(k, _)| keep_label(keep, k)) {
         let l = (format!("container_label_{}", sanitize_label_name(k)), v.clone());
         if k != COMPOSE_PROJECT && k != COMPOSE_SERVICE {
-            clean.push(l.clone());
+            upsert(&mut clean, l.clone());
         }
-        cadvisor.push(l);
+        upsert(&mut cadvisor, l);
     }
     Arc::new(Base { clean, cadvisor })
+}
+
+/// Labels that sanitize to the same name keep the last value.
+fn upsert(v: &mut Vec<(String, String)>, (k, val): (String, String)) {
+    match v.iter_mut().find(|(n, _)| *n == k) {
+        Some(e) => e.1 = val,
+        None => v.push((k, val)),
+    }
 }
 
 pub fn keep_label(patterns: &[String], key: &str) -> bool {
@@ -680,6 +688,17 @@ mod tests {
         assert!(counts(&st(true, false)));
         assert!(!counts(&st(true, true)));
         assert!(!counts(&st(false, false)));
+    }
+
+    #[test]
+    fn labels_sanitizing_alike_appear_once() {
+        let labels = BTreeMap::from([("com.x.a-b".to_string(), "dash".to_string()), ("com.x.a_b".to_string(), "under".to_string())]);
+        let c = Container { id: "d".repeat(64), name: "web".into(), labels, ..Default::default() };
+        let l = metric_labels(&c, "/docker/d", &["com.x.*".to_string()]);
+        for set in [&l.clean, &l.cadvisor] {
+            let got: Vec<_> = set.iter().filter(|(k, _)| k == "container_label_com_x_a_b").collect();
+            assert_eq!(got, [&("container_label_com_x_a_b".to_string(), "under".to_string())]);
+        }
     }
 
     #[test]
