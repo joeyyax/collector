@@ -24,6 +24,7 @@ pub struct Stats {
     pub errors: AtomicU64,
     pub unparsed: AtomicU64,
     pub lost_rotations: AtomicU64,
+    pub partials_split: AtomicU64,
     pub followed: AtomicU64,
     pub unsupported: AtomicU64,
     pub last_success: AtomicU64,
@@ -40,6 +41,7 @@ impl Stats {
         m.counter("collector_log_send_errors_total", "Failed log batch sends; each is retried.", &[], g(&self.errors));
         m.counter("collector_log_lines_unparsed_total", "Log file lines that were not valid json-file entries.", &[], g(&self.unparsed));
         m.counter("collector_log_rotations_missed_total", "Log files that rotated away before they were read.", &[], g(&self.lost_rotations));
+        m.counter("collector_log_partials_split_total", "Unfinished long lines sent in two or more records after logs.partial_timeout.", &[], g(&self.partials_split));
         m.gauge("collector_log_containers_followed", "Containers whose log files are followed.", &[], g(&self.followed));
         m.gauge("collector_log_containers_unsupported", "Running containers whose log driver isn't json-file.", &[], g(&self.unsupported));
         m.gauge("collector_log_last_success_timestamp_seconds", "Time of the last delivered batch.", &[], g(&self.last_success));
@@ -288,6 +290,9 @@ impl Shipper {
                 continue;
             };
             t.asm.push(Piece { stream: &parsed.stream, time: &parsed.time, text: &parsed.log, start: l.start, end: l.end }, &mut recs);
+        }
+        if t.asm.release_stale(self.cfg.partial_timeout, &mut recs) {
+            self.stats.partials_split.fetch_add(1, Ordering::Relaxed);
         }
         if t.gone && chunk.eof {
             if chunk.lines.is_empty() && t.asm.oldest_start().is_none() {

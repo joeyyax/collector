@@ -77,6 +77,8 @@ read_bytes = 262144
 poll = "1s"
 max_backoff = "30s"
 timeout = "10s"
+# An unfinished long line (a progress bar redrawn with \r) is sent as is after this, and the rest follows as a new record.
+partial_timeout = "2s"
 parse_level = true
 promote_fields = []
 # Docker label with a numeric VictoriaLogs AccountID per container; empty sends everything to tenant 0.

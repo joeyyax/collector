@@ -176,6 +176,9 @@ pub struct Logs {
     pub max_backoff: Duration,
     #[serde(with = "dur")]
     pub timeout: Duration,
+    /// How long an unfinished long line holds back its container before it's sent as is.
+    #[serde(with = "dur")]
+    pub partial_timeout: Duration,
     pub parse_level: bool,
     pub promote_fields: Vec<String>,
     /// Gzip request bodies to VictoriaLogs.
@@ -290,6 +293,7 @@ impl Default for Logs {
             poll: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             timeout: Duration::from_secs(10),
+            partial_timeout: Duration::from_secs(2),
             parse_level: true,
             promote_fields: Vec::new(),
             compress: true,
@@ -341,7 +345,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        let intervals = [("interval", self.interval), ("live_interval", self.live_interval), ("logs.poll", self.logs.poll), ("remote_write.interval", self.remote_write.interval)];
+        let intervals = [("interval", self.interval), ("live_interval", self.live_interval), ("logs.poll", self.logs.poll), ("logs.partial_timeout", self.logs.partial_timeout), ("remote_write.interval", self.remote_write.interval)];
         for (name, d) in intervals {
             if d.is_zero() {
                 return Err(format!("{name} must be greater than 0"));
@@ -536,6 +540,7 @@ mod tests {
         assert!(env_config(&[("COLLECTOR_LIVE_INTERVAL", "0s")]).is_err());
         assert!(env_config(&[("COLLECTOR_INTERVAL", "100000h")]).is_err());
         assert!(env_config(&[("COLLECTOR_LOGS__POLL", "0")]).unwrap_err().contains("logs.poll must be greater than 0"));
+        assert!(env_config(&[("COLLECTOR_LOGS__PARTIAL_TIMEOUT", "0")]).unwrap_err().contains("logs.partial_timeout must be greater than 0"));
         assert!(env_config(&[("COLLECTOR_REMOTE_WRITE__INTERVAL", "0s")]).unwrap_err().contains("remote_write.interval must be greater than 0"));
         assert!(env_config(&[("COLLECTOR_API__AUTH", "token")]).is_err());
         assert!(env_config(&[("COLLECTOR_API__AUTH", "token"), ("COLLECTOR_API__TOKEN", "t")]).is_ok());

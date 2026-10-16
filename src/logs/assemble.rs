@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 /// A finished log record: one source line, or Docker's partial pieces joined.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record<P> {
@@ -21,6 +23,7 @@ pub struct Piece<'a, P> {
 struct Held<P> {
     rec: Record<P>,
     open: bool,
+    since: Instant,
 }
 
 /// Rejoins Docker's 16 KB partial pieces per stream.
@@ -56,11 +59,20 @@ impl<P: Copy> Assembler<P> {
                 h.rec.end = end;
                 h.open = partial && h.rec.msg.len() < MAX_HELD_BYTES;
             }
-            None => self.held.push(Held { rec: Record { stream: stream.into(), time: time.into(), msg: body.into(), start, end }, open: partial }),
+            None => self.held.push(Held { rec: Record { stream: stream.into(), time: time.into(), msg: body.into(), start, end }, open: partial, since: Instant::now() }),
         }
         if self.bytes >= MAX_HELD_BYTES || !self.held.iter().any(|h| h.open) {
             self.flush(out);
         }
+    }
+
+    /// Emits everything held once the oldest record has waited `timeout`; the rest of an unfinished line becomes a new record.
+    pub fn release_stale(&mut self, timeout: Duration, out: &mut Vec<Record<P>>) -> bool {
+        let stale = self.held.first().is_some_and(|h| h.since.elapsed() >= timeout);
+        if stale {
+            self.flush(out);
+        }
+        stale
     }
 
     /// Emits everything held, unfinished records included.
@@ -128,6 +140,20 @@ mod tests {
         let mut out = Vec::new();
         a.push(Piece { stream: "stderr", time: "t", text: "b2\n", start: 3, end: 4 }, &mut out);
         assert_eq!(msgs(&out), ["a1a2", "b1b2"]);
+    }
+
+    #[test]
+    fn releases_held_records_after_the_timeout() {
+        let mut a = Assembler::default();
+        let mut out = feed(&mut a, &[("stdout", "10%\r20%"), ("stderr", "err\n")]);
+        assert!(!a.release_stale(Duration::from_secs(60), &mut out));
+        assert!(out.is_empty());
+        assert!(a.release_stale(Duration::ZERO, &mut out));
+        assert_eq!(msgs(&out), ["10%\r20%", "err"]);
+        let mut out = Vec::new();
+        a.push(Piece { stream: "stdout", time: "t", text: "30%\n", start: 2, end: 3 }, &mut out);
+        assert_eq!(msgs(&out), ["30%"]);
+        assert_eq!(a.oldest_start(), None);
     }
 
     #[test]

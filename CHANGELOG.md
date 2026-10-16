@@ -10,7 +10,7 @@ Breaking: only the `json-file` log driver is read, and `logs.multiline` is gone.
 - Fixed: a corrupt or empty cursor file was treated as a first run and skipped all history. It's now renamed to `log-cursors.json.bad-<time>`, logged as an error, and every container is read from its oldest file.
 - Fixed: cursor saves weren't durable. The file is fsynced before the rename, and the directory after.
 - Fixed: one tenant failing blocked every tenant, and a restart re-sent tenants that had already been delivered. Each tenant's batch is delivered, retried and committed on its own.
-- While a partial line is unfinished, that container's later lines wait behind it; the saved cursor no longer carries `replay_until`. A 0.3 cursor saved mid-partial re-sends the records after that point once.
+- While a partial line is unfinished, that container's later lines wait behind it, for at most `logs.partial_timeout` (2 s; 0 is a startup error). Then the unfinished part is sent as is and the rest follows as a new record, counted in `collector_log_partials_split_total`. The saved cursor no longer carries `replay_until`. A 0.3 cursor saved mid-partial re-sends the records after that point once.
 - Polling costs one `stat` per container instead of one per possible rotation.
 - `logs.poll` or `remote_write.interval` of 0 is a startup error.
 

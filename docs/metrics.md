@@ -192,6 +192,7 @@ Readings come from `nvidia-smi --query-gpu --loop-ms=<interval>`. Once it report
 | `collector_docker_up` | Whether the last Docker sync worked |
 | `collector_log_lines_shipped_total`, `collector_log_bytes_shipped_total`, `collector_log_batches_total`, `collector_log_send_errors_total` | Log delivery |
 | `collector_log_lines_unparsed_total`, `collector_log_rotations_missed_total` | Log data loss signals |
+| `collector_log_partials_split_total` | Unfinished long lines sent in pieces after `logs.partial_timeout` |
 | `collector_log_containers_followed`, `collector_log_last_success_timestamp_seconds` | |
 | `collector_remote_write_pushes_total`, `collector_remote_write_errors_total`, `collector_remote_write_last_success_timestamp_seconds` | |
 
