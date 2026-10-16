@@ -120,27 +120,17 @@ They ask the local collector on the port from `listen`, with the token from the 
 
 ## Logs
 
-| Log driver | How it's read |
-|---|---|
-| `json-file` (Docker's default) | The files under `/var/lib/docker/containers/<id>/`, rotations included. Exact resume by inode and byte offset |
-| `local`, `journald` | The Docker logs API, one follower thread per container. Resume by timestamp |
-| anything else (`syslog`, `gelf`, `fluentd`, `none`, ...) | Not readable. One warning per container at startup; counted in `collector_log_containers_unsupported` |
+Logs are read from Docker's `json-file` driver, the default: the files under `/var/lib/docker/containers/<id>/`, rotations included. Containers on any other driver (`local`, `journald`, `syslog`, `none`, ...) get one warning each and are counted in `collector_log_containers_unsupported`; switch them to `json-file` to ship their logs.
 
-- **Cursors** live in `/var/lib/collector/log-cursors.json` and are saved only after the sink accepts a batch. Restarts, including `kill -9`, neither repeat nor drop lines.
-- **Long lines.** Docker splits lines over 16 KB into pieces; they're joined back into one record, up to 1 MiB.
-- **Multi-line records** are off by default. `logs.multiline.mode`:
-  - `indent`: a line starting with a space or tab continues the previous one, which covers most stack traces.
-  - `continue`: lines matching `pattern` continue the previous one.
-  - `start`: lines matching `pattern` start a record, for example `^\d{4}-\d{2}-\d{2}`.
-  - A group is sent when the next record starts, after `timeout` (2 s) without a new line, or at `max_lines`/`max_bytes`.
-- **Backpressure.** One batch is in flight at a time (1 MiB or 5,000 records, gzipped on the wire). When the sink is down, that batch is retried with backoff and nothing else is read; the log files on disk are the buffer. API followers block on a bounded queue (`logs.api_queue_lines`).
-- **Shutdown.** SIGTERM stops reading, sends pending multi-line groups, waits up to `shutdown_timeout` (10 s) for the last batch and saves cursors. Give the container a longer stop timeout than that (`stop_grace_period: 20s`).
+- **Delivery is at least once.** Each container's cursor (inode and byte offset) lives in `/var/lib/collector/log-cursors.json` and is saved, with fsync, only after the sink accepts the batch. A crash or `kill -9` after the sink's 2xx but before the save sends that batch again on restart: at most one batch per tenant. Nothing is skipped.
+- **Rotation.** Files are read through open handles, so a rotation between polls can't swap a file under a cursor. The file holding the cursor stays readable after Docker deletes it, including when a `--rm` container is removed; lines in newer files deleted before they're read are counted in `collector_log_rotations_missed_total`.
+- **Long lines.** Docker splits lines over 16 KB into pieces; they're joined back into one record, up to 1 MiB. While a line is unfinished, later lines from that container wait behind it, so a restart resumes at its first piece without repeating anything.
+- **Backpressure.** Each tenant has one batch in flight (1 MiB or 5,000 records, gzipped on the wire). When the sink rejects or can't be reached, that batch is retried with backoff and that tenant's containers aren't read; the log files on disk are the buffer. Other tenants keep shipping.
+- **Shutdown.** SIGTERM stops reading, retries undelivered batches for up to `shutdown_timeout` (10 s) and saves cursors. Give the container a longer stop timeout than that (`stop_grace_period: 20s`).
 - **Skipped**: containers labeled `collector.logs=false` (`logs.exclude_label`), names matching `logs.exclude_names` and the collector itself.
-- **First run**: existing history is skipped (`logs.first_run = "end"`). Containers that start later are read from the beginning.
+- **First run**: existing history is skipped (`logs.first_run = "end"`). Containers that start later are read from the beginning. If the cursor file exists but can't be read, it's renamed to `log-cursors.json.bad-<time>`, an error is logged and every container is read from its oldest file: duplicates over a silent gap.
 - **Fields**: `_time`, `_msg`, `stream`, `host`, `container`, `container_id`, `image`, `compose_project`, `compose_service`, the labels kept by `containers.labels` and `containers.api_labels`, and `level` when the line is JSON with a recognizable level. `compose_project` and `compose_service` come from the Compose labels whether or not those lists keep them. A label never replaces one of these fields. Stream fields default to `host`, `container`, `compose_project`, `compose_service`.
 - **Tenants**: with `logs.tenant_label` set, each container's logs go to the VictoriaLogs tenant (`AccountID`) in that Docker label. Each flush sends one request per tenant; unlabeled containers and non-numeric values go to tenant 0. Without it, everything goes to tenant 0 unless `logs.headers` sets an `AccountID`.
-
-Lines lost to Docker's own rotation, when a file rotates out of `max-file` before it's read, are counted in `collector_log_rotations_missed_total`.
 
 ## Remote write
 

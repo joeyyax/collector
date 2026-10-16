@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+Breaking: only the `json-file` log driver is read, and `logs.multiline` is gone.
+
+- Removed: logs from the `local` and `journald` drivers through the Docker logs API. Those containers get one warning each and count in `collector_log_containers_unsupported`, like `syslog`. `collector_log_containers_followed_api` is gone. Cursor files with API entries still load; the entries are dropped.
+- Removed: `logs.multiline` and `logs.api_queue_lines`. A config or `COLLECTOR_*` override that still sets one fails at startup naming the key. Docker's 16 KB partial lines are still joined, up to 1 MiB.
+- Fixed: a rotation between reading the file list and opening a file could mislabel or skip bytes, and a file rotated mid-scan could be missed. Files are read through open handles identified by `fstat`; the file holding the cursor stays readable after Docker deletes it, so a removed `--rm` container's last lines still ship.
+- Fixed: a corrupt or empty cursor file was treated as a first run and skipped all history. It's now renamed to `log-cursors.json.bad-<time>`, logged as an error, and every container is read from its oldest file.
+- Fixed: cursor saves weren't durable. The file is fsynced before the rename, and the directory after.
+- Fixed: one tenant failing blocked every tenant, and a restart re-sent tenants that had already been delivered. Each tenant's batch is delivered, retried and committed on its own.
+- While a partial line is unfinished, that container's later lines wait behind it; the saved cursor no longer carries `replay_until`. A 0.3 cursor saved mid-partial re-sends the records after that point once.
+- Polling costs one `stat` per container instead of one per possible rotation.
+- `logs.poll` or `remote_write.interval` of 0 is a startup error.
+
 ## 0.3.1
 
 - Fixed: restarts, health and pids went stale after a gap in Docker's event stream, such as a dockerd restart. Events resume where they left off, and the periodic sync re-inspects containers whose process changed.

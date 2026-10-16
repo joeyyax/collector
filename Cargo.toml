@@ -1,6 +1,6 @@
 [package]
 name = "collector"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Per-host telemetry collector: host, container and GPU metrics plus container logs"

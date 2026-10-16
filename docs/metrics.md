@@ -183,7 +183,7 @@ Readings come from `nvidia-smi --query-gpu --loop-ms=<interval>`. Once it report
 |---|---|
 | `process_cpu_seconds_total`, `process_resident_memory_bytes` | Collector process only (not the `nvidia-smi` children) |
 | `collector_filesystems_hung` | Mounts whose `statfs` hasn't returned |
-| `collector_log_containers_followed_api`, `collector_log_containers_unsupported` | Containers on `local`/`journald` (read through the API) and on drivers that can't be read |
+| `collector_log_containers_unsupported` | Running containers on a log driver other than `json-file`, which aren't read |
 | `collector_remote_write_dropped_samples_total`, `collector_remote_write_queue_pushes`, `collector_remote_write_queue_bytes` | Remote-write retry queue |
 | `collector_panics_total` | Panics caught in collector threads; each is logged as an error |
 | `collector_heap_bytes` | Bytes allocated right now; compare with RSS to tell a leak from allocator overhead |
