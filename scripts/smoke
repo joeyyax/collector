@@ -53,6 +53,12 @@ if out=$(docker compose -f deploy/compose.yaml config -q 2>&1); then
 else
 	fail "compose file is valid: $out"
 fi
+sed -E 's/^( +)# (NVIDIA_[A-Z_]+:|runtime:|pid:|cap_add:)/\1\2/' deploy/compose.yaml > "$TMP/compose-gpu.yaml"
+if out=$(docker compose -f "$TMP/compose-gpu.yaml" config -q 2>&1); then
+	pass "compose file is valid with the GPU block uncommented"
+else
+	fail "compose file is valid with the GPU block uncommented: $out"
+fi
 
 # 2. Image for the host arch, loaded into the local daemon.
 echo "building $TAG"
