@@ -1,6 +1,6 @@
 # JSON API
 
-Read-only, `GET` only, on `127.0.0.1:9273` unless `listen` says otherwise. With `api.token` or `api.token_file` set, every endpoint except `/health` needs `Authorization: Bearer <token>` and answers 401 without it. `/metrics` is gzipped when the client sends `Accept-Encoding: gzip`, as Prometheus and VictoriaMetrics do.
+Read-only, `GET` only, on `127.0.0.1:9273` unless `listen` says otherwise. With `api.token` or `api.token_file` set, every endpoint except `/health` needs `Authorization: Bearer <token>` and answers 401 without it. Without a token the API is open; on an address other than loopback the collector logs a warning at startup unless `api.auth = "off"`. A response that makes no progress for 30 s is dropped, so a client that stops reading can't hold a worker or a stream. `/metrics` is gzipped when the client sends `Accept-Encoding: gzip`, as Prometheus and VictoriaMetrics do.
 
 Every response reflects the last collection (every `interval`, 15 s by default); nothing is read from the host on request. `/health` and each container carry `collected_at`, the Unix time of that collection in seconds, and `interval_seconds`, the configured interval. Judge staleness against `interval_seconds` rather than a fixed 15 s. While a client follows `/api/v1/stream`, collection runs every `live_interval` (5 s) instead.
 
@@ -32,10 +32,10 @@ Sorting is descending except for `name`. `cpu` is `usage_cores` and `memory` is 
 ## `GET /health`
 
 ```json
-{"status": "ok", "version": "0.3.0", "host": "web-1", "last_collect_age_seconds": 3.2, "collected_at": 1791656309.731, "interval_seconds": 15.0, "docker": true, "logs_last_success": 1791656289, "gpu_per_container": true}
+{"status": "ok", "version": "0.3.0", "host": "web-1", "auth": "token", "last_collect_age_seconds": 3.2, "collected_at": 1791656309.731, "interval_seconds": 15.0, "docker": true, "logs_last_success": 1791656289, "gpu_per_container": true}
 ```
 
-`status` is `stale` with HTTP 503 when the last collection is older than three intervals plus 5 s. The slack keeps one slow collection, such as a `statfs` timeout, from flipping a short interval to stale. `last_collect_age_seconds` and `collected_at` are `null` before the first collection. `docker` is present when container metrics are on, `logs_last_success` (epoch seconds) when logs are on.
+`status` is `stale` with HTTP 503 when the last collection is older than three intervals plus 5 s. The slack keeps one slow collection, such as a `statfs` timeout, from flipping a short interval to stale. `last_collect_age_seconds` and `collected_at` are `null` before the first collection. `auth` is `token` when the other endpoints need one and `open` otherwise. `docker` is present when container metrics are on, `logs_last_success` (epoch seconds) when logs are on.
 
 `gpu_per_container` is present when the host has a GPU. `true` means per-container GPU memory is read, so a container's empty `gpus` means it holds no GPU memory. `false` means it isn't read, usually because the collector runs without `pid: host`, so an empty `gpus` says nothing.
 
@@ -118,6 +118,8 @@ curl -N -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:9273/api/v1/stream?s
 ```
 
 `per_cpu` is omitted when `host_metrics.per_cpu = false`. `used_ratio` is used ÷ (used + available to non-root), as `df` reports it. `sensors[].kind` is `temp` (°C) or `fan` (RPM). `gpus` here has no `containers`; [`/api/v1/gpus`](#get-apiv1gpus) adds them.
+
+503 with `{"error": "no data yet"}` before the first collection; 404 with `{"error": "host metrics are disabled"}` when `host_metrics.enabled = false`.
 
 ## `GET /api/v1/containers`
 

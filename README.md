@@ -67,7 +67,7 @@ Without Docker: `collector --config collector.toml` with the default paths (`/pr
 
 One TOML file, every key optional. [collector.example.toml](collector.example.toml) lists them all with defaults.
 
-Environment variables override the file: `COLLECTOR_<KEY>` for top-level keys and `COLLECTOR_<SECTION>__<KEY>` (double underscore) for sections. Values parse as TOML, so lists work:
+Environment variables override the file: `COLLECTOR_<KEY>` for top-level keys and `COLLECTOR_<SECTION>__<KEY>` (double underscore) for sections. String settings take the value as written; others parse as TOML, so lists work:
 
 ```sh
 COLLECTOR_INTERVAL=30s
@@ -103,7 +103,7 @@ The binary listens on `127.0.0.1:9273` by default (`listen`). The image sets `0.
 
 Container lists, the snapshot and the stream take `sort` (`cpu`, `memory`, `net_rx`, `net_tx`, `disk_read`, `disk_write`, `name`) and `limit`, so `/api/v1/containers?sort=cpu&limit=10` is the ten busiest.
 
-With `api.token` or `api.token_file` set, requests need `Authorization: Bearer <token>`; without one the API is open. Requests are served by `api.workers` threads (4), so a slow client can't hold up a scrape; each stream gets its own thread, up to 16. Shapes and examples: [docs/api.md](docs/api.md).
+With `api.token` or `api.token_file` set, requests need `Authorization: Bearer <token>`; without one the API is open, and listening beyond loopback logs a warning unless `api.auth = "off"`. `api.auth = "token"` refuses to start without a token, and so does an empty `token_file`. Requests are served by `api.workers` threads (4), so a slow client can't hold up a scrape; each stream gets its own thread, up to 16. A response that makes no progress for 30 s is dropped. Shapes and examples: [docs/api.md](docs/api.md).
 
 ## Command line
 
@@ -116,7 +116,7 @@ shop-web    running  healthy  1.42  611.3 MiB  1.0 GiB    1.2 MiB/s   3.4 MiB/s 
 shop-redis  running  -        0.01  114.4 MiB  512.0 MiB  14.4 KiB/s  4.3 KiB/s  0 B/s  0 B/s       2
 ```
 
-They ask the local collector on the port from `listen`, with the token from the config. `--url` and `--token-file` point them at another one. `collector health` exits 1 when the collector is stale or unreachable.
+They ask the local collector on the port from `listen`, with the token from the config, and exit 2 when the config doesn't load. `--url` and `--token-file` point them at another one. `collector health` exits 1 when the collector is stale or unreachable.
 
 ## Logs
 
@@ -144,7 +144,7 @@ Lines lost to Docker's own rotation, when a file rotates out of `max-file` befor
 
 ## Remote write
 
-Remote write uses the clean metric names; set `metrics.compat = "cadvisor"` to push cAdvisor's. Each collection is encoded once (protobuf, snappy as the protocol requires) and queued. Failed pushes are retried in order with backoff up to `remote_write.max_backoff`; the queue holds up to `queue_bytes` (64 MiB; a push from a 20-container host is about 70 KB, so roughly seven hours) and drops the oldest first, counting them in `collector_remote_write_dropped_samples_total`. On SIGTERM the queue gets `shutdown_timeout` to drain.
+Remote write uses the clean metric names; set `metrics.compat = "cadvisor"` to push cAdvisor's. Each collection is encoded once (protobuf, snappy as the protocol requires) and queued. Pushes that fail with a 5xx, 429 or network error are retried in order with backoff up to `remote_write.max_backoff`; other 4xx answers drop the push and count it in `collector_remote_write_dropped_samples_total`; the queue holds up to `queue_bytes` (64 MiB; a push from a 20-container host is about 70 KB, so roughly seven hours) and drops the oldest first, counting them in `collector_remote_write_dropped_samples_total`. On SIGTERM the queue gets `shutdown_timeout` to drain.
 
 ## Build and release
 

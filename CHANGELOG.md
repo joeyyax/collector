@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed: environment overrides for string settings keep the value as written, so `COLLECTOR_API__TOKEN=123456` no longer stops startup and quotes are no longer stripped.
+- Durations accept fractions such as `COLLECTOR_INTERVAL=0.5` or `interval = 0.5`. `interval` or `live_interval` of 0 and durations over 366 days are startup errors.
+- Without a token, listening beyond loopback logs a warning at startup unless `api.auth = "off"`; `api.auth = "token"` refuses to start without one. `/health` adds `auth`: `token` or `open`.
+- An empty `api.token_file` is a startup error; it used to leave the API open.
+- `/api/v1/host` answers 404 `host metrics are disabled` when they're off, instead of 503 `no data yet` forever. `/health` reports `host` with host metrics off.
+- A response that makes no progress for 30 s is dropped, so clients that stop reading `/metrics` or a stream can't pin the workers or stream slots.
+- Remote write drops a push the receiver rejects with a 4xx other than 429 and counts its samples in `collector_remote_write_dropped_samples_total`; 5xx, 429 and network errors are still retried.
+- A panic in one thread no longer stops the process: it's logged and counted in `collector_panics_total`. Host and container collection fail independently, and remote write restarts.
+- `deploy/compose.yaml`: uncommenting the GPU lines yields a valid file.
+- `collector health`, `host`, `containers` and `gpus` report a config that doesn't load instead of falling back to defaults.
+- `COLLECTOR_VERSION` in the environment is ignored instead of failing as an unknown key.
+
 ## 0.3.0
 
 Breaking: container metrics use clean names by default. See [Migrating from 0.2](docs/metrics.md#migrating-from-02).
