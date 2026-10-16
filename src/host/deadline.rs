@@ -28,20 +28,20 @@ impl Deadline {
         let mut out = HashMap::new();
         let mut waiting = 0;
         for (key, job) in jobs {
-            if !self.stuck.lock().unwrap().insert(key.clone()) {
+            if !self.stuck.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone()) {
                 out.insert(key, Outcome::Hung);
                 continue;
             }
             let (tx, stuck, k) = (tx.clone(), self.stuck.clone(), key.clone());
             let spawned = std::thread::Builder::new().name("statfs".into()).stack_size(64 << 10).spawn(move || {
                 let v = job();
-                stuck.lock().unwrap().remove(&k);
+                stuck.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&k);
                 let _ = tx.send((k, v));
             });
             match spawned {
                 Ok(_) => waiting += 1,
                 Err(_) => {
-                    self.stuck.lock().unwrap().remove(&key);
+                    self.stuck.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
                     out.insert(key, Outcome::Hung);
                 }
             }
@@ -61,7 +61,7 @@ impl Deadline {
     }
 
     pub fn stuck(&self) -> usize {
-        self.stuck.lock().unwrap().len()
+        self.stuck.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 }
 
@@ -77,7 +77,7 @@ mod tests {
     fn slow_job_is_skipped_until_it_returns() {
         let d = Deadline::default();
         let gate = Arc::new(Mutex::new(()));
-        let hold = gate.lock().unwrap();
+        let hold = gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let g = gate.clone();
         let r = d.run(vec![("fast".into(), job(|| 1)), ("slow".into(), job(move || { drop(g.lock()); 2 }))], Duration::from_millis(100));
         assert_eq!(r["fast"], Outcome::Done(1));

@@ -21,12 +21,12 @@ pub struct Sizes(Arc<RwLock<HashMap<String, Size>>>);
 
 impl Sizes {
     pub fn get(&self, id: &str) -> Option<Size> {
-        self.0.read().unwrap().get(id).copied()
+        self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(id).copied()
     }
 
     #[cfg(test)]
     pub fn set(&self, id: &str, size: Size) {
-        self.0.write().unwrap().insert(id.to_string(), size);
+        self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.to_string(), size);
     }
 
     pub fn start(&self, registry: Registry, rootfs: PathBuf, interval: Duration) {
@@ -40,7 +40,7 @@ impl Sizes {
             let ctrs = registry.all();
             let now = util::now_secs();
             let next = {
-                let mut sizes = self.0.write().unwrap();
+                let mut sizes = self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let ids: HashSet<&str> = ctrs.iter().map(|c| c.id.as_str()).collect();
                 sizes.retain(|id, _| ids.contains(id.as_str()));
                 next_due(&ctrs, &sizes, now, interval.as_secs_f64())
@@ -52,7 +52,7 @@ impl Sizes {
                         if errors > 0 && !warned.swap(true, Ordering::Relaxed) {
                             log::warn!("writable layer: {} has {errors} unreadable directories, so its size is low; give the collector CAP_DAC_READ_SEARCH", c.name);
                         }
-                        self.0.write().unwrap().insert(c.id.clone(), Size { bytes, measured_at: util::now_secs() });
+                        self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(c.id.clone(), Size { bytes, measured_at: util::now_secs() });
                     }
                     None => log::debug!("writable layer: {} not found under {}", upper, rootfs.display()),
                 }

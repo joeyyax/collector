@@ -92,7 +92,7 @@ impl Registry {
     }
 
     pub fn all(&self) -> Vec<Arc<Container>> {
-        let mut v: Vec<_> = self.inner.read().unwrap().values().cloned().collect();
+        let mut v: Vec<_> = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -152,7 +152,7 @@ impl Registry {
                 return;
             }
         };
-        let current = self.inner.read().unwrap().clone();
+        let current = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let mut next = HashMap::new();
         for s in list.into_iter().filter(|s| running(&s.state)) {
             let cached = current.get(&s.id);
@@ -178,16 +178,16 @@ impl Registry {
         }
         for (id, c) in current.into_iter().filter(|(id, _)| !next.contains_key(id)) {
             let st = docker.inspect(&id).ok().flatten().map(|i| i.state);
-            self.life.lock().unwrap().stopped(c, st.as_ref(), util::now_secs());
+            self.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stopped(c, st.as_ref(), util::now_secs());
         }
         log::debug!("registry: {} running containers", next.len());
-        *self.inner.write().unwrap() = next;
+        *self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
         self.synced.store(true, Ordering::Relaxed);
     }
 
     /// Builds a container from inspect and records its lifecycle state.
     fn inspected(&self, i: docker::Inspect, cgroot: &Path, proc: &Path, rules: &config::Containers) -> Container {
-        let mut life = self.life.lock().unwrap();
+        let mut life = self.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         life.inspected(&i.id, &i.state);
         if running(&i.state.status) {
             life.running(&i.id);
@@ -199,7 +199,7 @@ impl Registry {
 impl Registry {
     /// Re-inspects only the containers an event named, dropping any that are gone or no longer running.
     fn update(&self, docker: &Docker, cgroot: &Path, proc: &Path, rules: &config::Containers, ids: &[String]) {
-        let mut next = self.inner.read().unwrap().clone();
+        let mut next = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let now = util::now_secs();
         for id in ids {
             match docker.inspect(id) {
@@ -210,17 +210,17 @@ impl Registry {
                 Ok(Some(i)) => {
                     let st = i.state.clone();
                     let c = next.remove(id).unwrap_or_else(|| Arc::new(self.inspected(i, cgroot, proc, rules)));
-                    self.life.lock().unwrap().stopped(c, Some(&st), now);
+                    self.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stopped(c, Some(&st), now);
                 }
                 Ok(None) => {
                     if let Some(c) = next.remove(id) {
-                        self.life.lock().unwrap().stopped(c, None, now);
+                        self.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stopped(c, None, now);
                     }
                 }
                 Err(e) => log::debug!("{e}"),
             }
         }
-        *self.inner.write().unwrap() = next;
+        *self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
     }
 }
 
@@ -258,7 +258,7 @@ fn spawn_events(docker: Docker, tx: Sender<Option<String>>, life: Arc<Mutex<life
                     if ev.kind != "container" {
                         return;
                     }
-                    life.lock().unwrap().event(&ev.actor.id, &ev.action, &ev.actor.attributes, ev.at(util::now_secs()));
+                    life.lock().unwrap_or_else(std::sync::PoisonError::into_inner).event(&ev.actor.id, &ev.action, &ev.actor.attributes, ev.at(util::now_secs()));
                     if matches!(ev.action.as_str(), "start" | "restart" | "die" | "destroy" | "rename" | "pause" | "unpause") || ev.action.starts_with("health_status") {
                         let _ = tx.send(Some(ev.actor.id));
                     }
@@ -479,7 +479,7 @@ impl ContainerCollector {
             None => HashMap::new(),
         };
         let (exits, stopped) = {
-            let mut life = self.registry.life.lock().unwrap();
+            let mut life = self.registry.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             life.expire(now, &ids);
             let exits: HashMap<String, lifecycle::Exit> = ctrs.iter().filter_map(|c| Some((c.id.clone(), life.exit(&c.id)?))).collect();
             let stopped: Vec<_> = life.stopped_list().into_iter().map(|s| (life.exit(&s.meta.id), s)).collect();
@@ -729,7 +729,7 @@ mod tests {
         r.set(&format!("/containers/{id}/json"), 200, inspect_json(&id, "restarting", 0, 1, ""));
         reg.update(&d, &root, &root, &config::Containers::default(), std::slice::from_ref(&id));
         assert!(reg.all().is_empty());
-        assert_eq!(reg.life.lock().unwrap().stopped_list().iter().map(|s| s.state.as_str()).collect::<Vec<_>>(), ["restarting"]);
+        assert_eq!(reg.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stopped_list().iter().map(|s| s.state.as_str()).collect::<Vec<_>>(), ["restarting"]);
         // The list reports `restarting` too, so a full sync agrees.
         r.set("/containers/json", 200, format!(r#"[{{"Id":"{id}","State":"restarting","Status":"Restarting (1) 2 seconds ago"}}]"#));
         reg.sync(&d, &root, &root, &config::Containers::default(), &[]);
@@ -756,7 +756,7 @@ mod tests {
         r.set(&path, 404, "{}");
         reg.update(&d, &root, &root, &rules, std::slice::from_ref(&id));
         assert!(reg.all().is_empty());
-        assert_eq!(reg.life.lock().unwrap().stopped_list()[0].state, "removed");
+        assert_eq!(reg.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stopped_list()[0].state, "removed");
     }
 
     #[test]
@@ -814,7 +814,7 @@ mod tests {
             std::fs::create_dir_all(root.join(format!("proc/{pid}/net"))).unwrap();
             std::fs::write(root.join(format!("proc/{pid}/net/dev")), "Inter-|\n face |\n  eth0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n").unwrap();
             let c = Container { id, name: mode.into(), pid, network_mode: mode.into(), cgroup: Some(cg), ..Default::default() };
-            registry.inner.write().unwrap().insert(c.id.clone(), Arc::new(c));
+            registry.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(c.id.clone(), Arc::new(c));
         }
         let got = ContainerCollector::new(&cfg, registry, None, layer::Sizes::default()).collect(&mut MetricSet::new()).running;
         let _ = std::fs::remove_dir_all(&root);
@@ -900,7 +900,7 @@ mod tests {
         .unwrap();
         let c = build(inspect, &cfg.paths.sys.join("fs/cgroup"), &cfg.paths.proc, &cfg.containers);
         let registry = Registry::new();
-        registry.inner.write().unwrap().insert(c.id.clone(), Arc::new(c));
+        registry.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(c.id.clone(), Arc::new(c));
         let gpu = gpu::Watcher::with_apps(cfg.interval, vec![gpu::App { pid: 4242, uuid: "1111".into(), memory_used_bytes: 1 << 20 }]);
         let sizes = layer::Sizes::default();
         sizes.set(&id, layer::Size { bytes: 4096, measured_at: 1.5 });
@@ -939,17 +939,17 @@ mod tests {
         let registry = Registry::new();
         let none = BTreeMap::new();
         {
-            let mut life = registry.life.lock().unwrap();
+            let mut life = registry.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             life.event(&web, "oom", &none, 100.0);
             life.event(&web, "die", &BTreeMap::from([("exitCode".to_string(), "137".to_string())]), 100.5);
             life.event(&web, "start", &none, 101.0);
         }
         let c = registry.inspected(inspect(&web, "/web", serde_json::json!({"Status": "running", "Running": true, "Pid": 0, "Health": {"Status": "healthy"}})), &root, &root, &cfg.containers);
-        registry.inner.write().unwrap().insert(web.clone(), Arc::new(c));
+        registry.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(web.clone(), Arc::new(c));
         let gone = registry.inspected(inspect(&job, "/job", serde_json::json!({"Status": "running", "Running": true, "Pid": 0})), &root, &root, &cfg.containers);
         let finished = util::now_secs() - 30.0;
         let st = docker::InspectState { status: "exited".into(), exit_code: 3, finished_at: format_rfc3339(finished), ..Default::default() };
-        registry.life.lock().unwrap().stopped(Arc::new(gone), Some(&st), util::now_secs());
+        registry.life.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stopped(Arc::new(gone), Some(&st), util::now_secs());
 
         let mut m = MetricSet::new();
         let got = ContainerCollector::new(&cfg, registry, None, layer::Sizes::default()).collect(&mut m);

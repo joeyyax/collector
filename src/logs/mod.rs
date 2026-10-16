@@ -649,7 +649,7 @@ mod tests {
     impl sink::Sink for Recorder {
         fn send(&mut self, body: &[u8], tenant: Option<u32>) -> Result<(), String> {
             let names = String::from_utf8_lossy(body).lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["container"].as_str().unwrap().to_string()).collect();
-            self.0.lock().unwrap().push((tenant, names));
+            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((tenant, names));
             Ok(())
         }
     }
@@ -680,7 +680,7 @@ mod tests {
         let ok = shipper.drain(&mut Recorder(sent.clone()), &mut tracked, &mut State::default(), &rx, &mut 0, false);
         let _ = std::fs::remove_dir_all(&root);
         assert!(ok);
-        let mut out = sent.lock().unwrap().clone();
+        let mut out = sent.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         for (_, names) in &mut out {
             names.sort();
         }

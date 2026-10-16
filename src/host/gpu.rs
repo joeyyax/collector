@@ -107,7 +107,7 @@ impl Watcher {
                                 seen = true;
                                 self.start_apps(bin, per_process);
                             }
-                            self.latest.lock().unwrap().insert(g.index, (g, Instant::now()));
+                            self.latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(g.index, (g, Instant::now()));
                         }
                     });
                     let _ = child.wait();
@@ -150,7 +150,7 @@ impl Watcher {
                     // An idle GPU prints no apps, so only a stalled GPU loop marks this one hung.
                     follow(&mut child, self.interval * 3, || self.latest().is_empty(), |line| {
                         if let Some(a) = parse_app(line) {
-                            self.apps.lock().unwrap().feed(a, Instant::now(), gap);
+                            self.apps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).feed(a, Instant::now(), gap);
                         }
                     });
                     let _ = child.wait();
@@ -165,13 +165,13 @@ impl Watcher {
     pub fn with_apps(interval: Duration, apps: Vec<App>) -> Self {
         let w = Self { latest: Arc::default(), apps: Arc::default(), per_container: Arc::new(AtomicBool::new(true)), interval };
         let now = Instant::now();
-        apps.into_iter().for_each(|a| w.apps.lock().unwrap().feed(a, now, interval));
+        apps.into_iter().for_each(|a| w.apps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).feed(a, now, interval));
         w
     }
 
     /// GPU processes from the newest round; empty when no process has a GPU context.
     pub fn apps(&self) -> Vec<App> {
-        self.apps.lock().unwrap().current(Instant::now(), self.interval * 3 / 2)
+        self.apps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).current(Instant::now(), self.interval * 3 / 2)
     }
 
     /// Whether per-process GPU memory is being read, so a container's empty `gpus` means it holds no GPU memory.
@@ -181,7 +181,7 @@ impl Watcher {
 
     /// Readings newer than three intervals, by GPU index.
     pub fn latest(&self) -> Vec<Gpu> {
-        let map = self.latest.lock().unwrap();
+        let map = self.latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.values().filter(|(_, at)| at.elapsed() < self.interval * 3).map(|(g, _)| g.clone()).collect()
     }
 }

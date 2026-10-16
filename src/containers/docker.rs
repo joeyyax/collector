@@ -349,10 +349,10 @@ pub mod fake {
 
     impl Routes {
         pub fn set(&self, path: &str, status: u16, body: impl Into<String>) {
-            self.map.lock().unwrap().insert(path.to_string(), (status, body.into()));
+            self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.to_string(), (status, body.into()));
         }
         pub fn hits(&self, path: &str) -> usize {
-            self.seen.lock().unwrap().iter().filter(|p| p.split('?').next() == Some(path)).count()
+            self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|p| p.split('?').next() == Some(path)).count()
         }
     }
 
@@ -369,9 +369,9 @@ pub mod fake {
                     continue;
                 }
                 let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
-                r.seen.lock().unwrap().push(path.clone());
+                r.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.clone());
                 let key = path.split('?').next().unwrap_or("");
-                let (status, body) = r.map.lock().unwrap().get(key).cloned().unwrap_or((404, "{}".into()));
+                let (status, body) = r.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned().unwrap_or((404, "{}".into()));
                 let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}", body.len());
             }
         });
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(got, ["start"]);
         assert_eq!(since, 4_102_444_800_000_000_123);
         let _ = d.events(&mut since, |_| {});
-        let seen = r.seen.lock().unwrap();
+        let seen = r.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(!seen[0].contains("since="));
         assert!(seen[1].ends_with("&since=4102444800.000000123"), "{}", seen[1]);
     }

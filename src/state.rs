@@ -50,18 +50,18 @@ impl Live {
     }
 
     pub fn seq(&self) -> u64 {
-        *self.seq.lock().unwrap()
+        *self.seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Waits up to `timeout` for a snapshot newer than `seen`; returns the new sequence number.
     pub fn wait(&self, seen: u64, timeout: Duration) -> Option<u64> {
-        let g = self.seq.lock().unwrap();
+        let g = self.seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (g, _) = self.cv.wait_timeout_while(g, timeout, |s| *s == seen).unwrap();
         (*g != seen).then_some(*g)
     }
 
     fn bump(&self) {
-        *self.seq.lock().unwrap() += 1;
+        *self.seq.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         self.cv.notify_all();
     }
 }
@@ -83,11 +83,11 @@ pub struct Shared {
 
 impl Shared {
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Snapshot> {
-        self.snap.read().unwrap()
+        self.snap.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn store(&self, s: Snapshot) {
-        *self.snap.write().unwrap() = s;
+        *self.snap.write().unwrap_or_else(std::sync::PoisonError::into_inner) = s;
         self.live.bump();
     }
 
