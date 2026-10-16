@@ -2,6 +2,12 @@
 
 ## 0.3.1
 
+- Fixed: restarts, health and pids went stale after a gap in Docker's event stream, such as a dockerd restart. Events resume where they left off, and the periodic sync re-inspects containers whose process changed.
+- Fixed: a timed-out or failed inspect marked a running container as removed. Only a 404 does now.
+- Fixed: restarting containers were missing from both the running and stopped lists. They're listed as stopped with state `restarting`.
+- Containers sharing another container's network namespace (`network_mode: container:<id>`) report no network, like host-network ones, so traffic isn't counted twice.
+- Fixed: two kept labels that sanitize to the same metric label name broke the scrape. The last one wins.
+- A `nvidia-smi` that stops printing is killed and restarted.
 - Fixed: environment overrides for string settings keep the value as written, so `COLLECTOR_API__TOKEN=123456` no longer stops startup and quotes are no longer stripped.
 - Durations accept fractions such as `COLLECTOR_INTERVAL=0.5` or `interval = 0.5`. `interval` or `live_interval` of 0 and durations over 366 days are startup errors.
 - Without a token, listening beyond loopback logs a warning at startup unless `api.auth = "off"`; `api.auth = "token"` refuses to start without one. `/health` adds `auth`: `token` or `open`.
