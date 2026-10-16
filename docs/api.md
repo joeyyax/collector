@@ -164,7 +164,7 @@ An array of the objects below, sorted by name unless `sort` says otherwise.
 - `cpu.usage_cores` is cores in use: 1.0 is one full core. `limit_cores` comes from `cpu.max`; `null` means unlimited.
 - `memory.limit_bytes` and `pids.limit` are `null` when unlimited. `peak_bytes` is `null` on kernels before 5.19.
 - `pids.current` is `pids.current` from the cgroup, which counts every thread. `pids.processes` counts processes in `cgroup.procs`, including child cgroups, and is `null` when that file can't be read.
-- `network` is empty for `network_mode: host` containers.
+- `network` is empty for containers with `network_mode: host`, `container:<name>` or Compose's `service:<name>`, which share another network namespace.
 - `gpus` has one entry per GPU the container's processes hold memory on, summed over its processes. It's empty for containers with no GPU processes, without GPUs and when the collector doesn't run with `pid: host`; `/health` says which via `gpu_per_container`. `uuid` matches `uuid` in `/api/v1/gpus`.
 - `writable_layer` is `null` until the container is measured, and always without `containers.writable_layer`. `bytes` counts every file in the container's writable layer, hard links once; `measured_at` is Unix seconds. See [Writable layer](#writable-layer).
 

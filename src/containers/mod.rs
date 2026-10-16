@@ -66,6 +66,10 @@ impl Container {
     pub fn short_id(&self) -> &str {
         &self.id[..self.id.len().min(12)]
     }
+    /// False for `host` and `container:<id>` network modes, which share another namespace.
+    pub fn own_network(&self) -> bool {
+        self.network_mode != "host" && !self.network_mode.starts_with("container:")
+    }
 }
 
 /// Running containers, kept current from the Docker API and its event stream.
@@ -553,7 +557,7 @@ impl ContainerCollector {
 
             let mut network = Vec::new();
             let mut net_prev = HashMap::new();
-            if self.network && c.network_mode != "host" && c.pid > 0 {
+            if self.network && c.own_network() && c.pid > 0 {
                 let devs = procfs::parse_net_dev(&read(self.proc.join(format!("{}/net/dev", c.pid))).unwrap_or_default());
                 for n in devs.into_iter().filter(|n| n.device != "lo") {
                     emit_net(m, "container_network", Some(l), &[("interface", &n.device)], &n);
@@ -688,6 +692,29 @@ mod tests {
         assert!(counts(&st(true, false)));
         assert!(!counts(&st(true, true)));
         assert!(!counts(&st(false, false)));
+    }
+
+    #[test]
+    fn shared_network_namespaces_report_no_network() {
+        let root = std::env::temp_dir().join(format!("collector-netns-{}", std::process::id()));
+        let mut cfg = Config::default();
+        cfg.paths.sys = root.join("sys");
+        cfg.paths.proc = root.join("proc");
+        let registry = Registry::new();
+        for (n, (pid, mode)) in [(10, "bridge"), (11, "host"), (12, "container:abc"), (13, "shop_default")].into_iter().enumerate() {
+            let id = format!("{n}").repeat(64);
+            let cg = root.join(format!("sys/fs/cgroup/system.slice/docker-{id}.scope"));
+            std::fs::create_dir_all(&cg).unwrap();
+            std::fs::write(cg.join("cpu.stat"), "usage_usec 1\n").unwrap();
+            std::fs::create_dir_all(root.join(format!("proc/{pid}/net"))).unwrap();
+            std::fs::write(root.join(format!("proc/{pid}/net/dev")), "Inter-|\n face |\n  eth0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n").unwrap();
+            let c = Container { id, name: mode.into(), pid, network_mode: mode.into(), cgroup: Some(cg), ..Default::default() };
+            registry.inner.write().unwrap().insert(c.id.clone(), Arc::new(c));
+        }
+        let got = ContainerCollector::new(&cfg, registry, None, layer::Sizes::default()).collect(&mut MetricSet::new()).running;
+        let _ = std::fs::remove_dir_all(&root);
+        let with_net: Vec<_> = got.iter().filter(|s| !s.network.is_empty()).map(|s| s.meta.name.as_str()).collect();
+        assert_eq!(with_net, ["bridge", "shop_default"]);
     }
 
     #[test]
