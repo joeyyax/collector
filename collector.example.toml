@@ -17,6 +17,8 @@ shutdown_timeout = "10s"
 token = ""
 token_file = ""
 workers = 4
+# "auto": token if set, else open with a startup warning beyond loopback. "token" requires one; "off" stays open without the warning.
+auth = "auto"
 
 [metrics]
 # Names for remote write: "none" for clean names, "cadvisor" for cAdvisor's. Scrapes choose with ?compat=.

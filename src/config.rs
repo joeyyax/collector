@@ -38,12 +38,22 @@ pub struct Api {
     pub token_file: PathBuf,
     /// Threads serving requests, so one slow client can't block a scrape.
     pub workers: usize,
+    /// `auto` uses the token when one is set, `token` requires one, `off` serves openly without the warning.
+    pub auth: Auth,
 }
 
 impl Default for Api {
     fn default() -> Self {
-        Self { token: String::new(), token_file: PathBuf::new(), workers: 4 }
+        Self { token: String::new(), token_file: PathBuf::new(), workers: 4, auth: Auth::Auto }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Auth {
+    Auto,
+    Token,
+    Off,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -354,44 +364,73 @@ impl Config {
         if !cfg.api.token_file.as_os_str().is_empty() {
             let p = &cfg.api.token_file;
             cfg.api.token = std::fs::read_to_string(p).map_err(|e| format!("token_file {}: {e}", p.display()))?.trim().to_string();
+            if cfg.api.token.is_empty() {
+                return Err(format!("token_file {}: empty", p.display()));
+            }
         }
         if cfg.remote_write.labels.is_empty() {
             cfg.remote_write.labels.insert("host".into(), cfg.host.clone());
         }
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (name, d) in [("interval", self.interval), ("live_interval", self.live_interval)] {
+            if d.is_zero() {
+                return Err(format!("{name} must be greater than 0"));
+            }
+        }
+        match (self.api.auth, self.api.token.is_empty()) {
+            (Auth::Token, true) => Err("api.auth = \"token\" needs api.token or api.token_file".into()),
+            (Auth::Off, false) => Err("api.auth = \"off\" conflicts with the token set; remove one".into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether to warn that the API is open: no token, a non-loopback address and `auth` not `off`.
+    pub fn warn_open(&self, bound: Option<std::net::SocketAddr>) -> bool {
+        self.api.token.is_empty() && self.api.auth != Auth::Off && bound.is_some_and(|a| !a.ip().is_loopback())
     }
 }
 
-/// Maps COLLECTOR_SECTION__KEY=value onto [section] key = value; values parse as TOML when they can.
+/// Maps COLLECTOR_SECTION__KEY=value onto [section] key = value.
 pub fn apply_env(table: &mut toml::Table, vars: impl Iterator<Item = (String, String)>) {
     for (k, v) in vars {
         let Some(rest) = k.strip_prefix(ENV_PREFIX) else { continue };
-        if rest == "CONFIG" {
+        if rest == "CONFIG" || rest == "VERSION" {
             continue;
         }
         let parts: Vec<String> = rest.split("__").map(|p| p.to_ascii_lowercase()).collect();
-        let value = parse_env_value(&v);
-        let mut cur = &mut *table;
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                cur.insert(part.clone(), value.clone());
-            } else {
-                let entry = cur.entry(part.clone()).or_insert_with(|| toml::Value::Table(toml::Table::new()));
-                if !entry.is_table() {
-                    *entry = toml::Value::Table(toml::Table::new());
-                }
-                cur = entry.as_table_mut().unwrap();
-            }
-        }
+        let value = env_value(&parts, &v);
+        set(table, &parts, value);
     }
 }
 
-fn parse_env_value(v: &str) -> toml::Value {
-    let wrapped = format!("v = {v}");
-    match wrapped.parse::<toml::Table>() {
-        Ok(mut t) => t.remove("v").unwrap_or_else(|| toml::Value::String(v.into())),
-        Err(_) => toml::Value::String(v.into()),
+fn set(table: &mut toml::Table, parts: &[String], value: toml::Value) {
+    let mut cur = table;
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            cur.insert(part.clone(), value);
+            return;
+        }
+        let entry = cur.entry(part.clone()).or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !entry.is_table() {
+            *entry = toml::Value::Table(toml::Table::new());
+        }
+        cur = entry.as_table_mut().unwrap();
     }
+}
+
+/// The raw string when the key accepts one, else the value parsed as TOML.
+fn env_value(parts: &[String], v: &str) -> toml::Value {
+    let raw = toml::Value::String(v.into());
+    let mut probe = toml::Table::new();
+    set(&mut probe, parts, raw.clone());
+    if toml::Value::Table(probe).try_into::<Config>().is_ok() {
+        return raw;
+    }
+    format!("v = {v}").parse::<toml::Table>().ok().and_then(|mut t| t.remove("v")).unwrap_or(raw)
 }
 
 fn detect_hostname(rootfs: &std::path::Path) -> String {
@@ -425,7 +464,18 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         "h" => n * 3600.0,
         _ => return Err(format!("bad duration unit in {s:?}")),
     };
-    Ok(Duration::from_secs_f64(secs))
+    secs_to_duration(secs).map_err(|e| format!("{e}: {s:?}"))
+}
+
+/// Longest duration any setting accepts.
+const MAX_DURATION: Duration = Duration::from_secs(366 * 86400);
+
+fn secs_to_duration(secs: f64) -> Result<Duration, String> {
+    match Duration::try_from_secs_f64(secs) {
+        Ok(d) if d <= MAX_DURATION => Ok(d),
+        Ok(_) => Err("duration over 366 days".into()),
+        Err(_) => Err("bad duration".into()),
+    }
 }
 
 mod dur {
@@ -438,11 +488,14 @@ mod dur {
         enum Raw {
             S(String),
             N(u64),
+            F(f64),
         }
         match Raw::deserialize(d)? {
-            Raw::S(s) => super::parse_duration(&s).map_err(serde::de::Error::custom),
-            Raw::N(n) => Ok(Duration::from_secs(n)),
+            Raw::S(s) => super::parse_duration(&s),
+            Raw::N(n) => super::secs_to_duration(n as f64),
+            Raw::F(f) => super::secs_to_duration(f),
         }
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -456,6 +509,85 @@ mod tests {
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
         assert!(parse_duration("3x").is_err());
+        assert_eq!(parse_duration("0.5").unwrap(), Duration::from_millis(500));
+        assert!(parse_duration("99999999999999999999h").is_err());
+        assert!(parse_duration("9000h").is_err());
+        let file = |s: &str| s.parse::<toml::Table>().map_err(|e| e.to_string()).and_then(|t| toml::Value::Table(t).try_into::<Config>().map_err(|e| e.to_string()));
+        assert_eq!(file("interval = 0.25").unwrap().interval, Duration::from_millis(250));
+        assert!(file("interval = 9223372036854775807").is_err());
+        assert!(file("interval = -1").is_err());
+    }
+
+    fn env_config(vars: &[(&str, &str)]) -> Result<Config, String> {
+        let mut t = toml::Table::new();
+        apply_env(&mut t, vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let cfg: Config = toml::Value::Table(t).try_into().map_err(|e| e.to_string())?;
+        cfg.validate().map(|_| cfg)
+    }
+
+    #[test]
+    fn env_keeps_strings_raw() {
+        let cfg = env_config(&[
+            ("COLLECTOR_API__TOKEN", "123456"),
+            ("COLLECTOR_HOST", "'abc'"),
+            ("COLLECTOR_INTERVAL", "0.5"),
+            ("COLLECTOR_LIVE_INTERVAL", "2"),
+            ("COLLECTOR_LOGS__BATCH_LINES", "100"),
+            ("COLLECTOR_LOGS__COMPRESS", "false"),
+            ("COLLECTOR_LOGS__EXCLUDE_NAMES", r#"["^a", "^b"]"#),
+            ("COLLECTOR_REMOTE_WRITE__LABELS__DC", "1"),
+            ("COLLECTOR_GPU__ENABLED", "off"),
+            ("COLLECTOR_VERSION", "1.2.3"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.api.token, "123456");
+        assert_eq!(cfg.host, "'abc'");
+        assert_eq!(cfg.interval, Duration::from_millis(500));
+        assert_eq!(cfg.live_interval, Duration::from_secs(2));
+        assert_eq!(cfg.logs.batch_lines, 100);
+        assert!(!cfg.logs.compress);
+        assert_eq!(cfg.logs.exclude_names, ["^a", "^b"]);
+        assert_eq!(cfg.remote_write.labels["dc"], "1");
+        assert_eq!(cfg.gpu.enabled, Toggle::Off);
+    }
+
+    #[test]
+    fn validates_intervals_and_auth() {
+        assert!(env_config(&[]).is_ok());
+        assert!(env_config(&[("COLLECTOR_INTERVAL", "0")]).unwrap_err().contains("interval must be greater than 0"));
+        assert!(env_config(&[("COLLECTOR_LIVE_INTERVAL", "0s")]).is_err());
+        assert!(env_config(&[("COLLECTOR_INTERVAL", "100000h")]).is_err());
+        assert!(env_config(&[("COLLECTOR_API__AUTH", "token")]).is_err());
+        assert!(env_config(&[("COLLECTOR_API__AUTH", "token"), ("COLLECTOR_API__TOKEN", "t")]).is_ok());
+        assert!(env_config(&[("COLLECTOR_API__AUTH", "off"), ("COLLECTOR_API__TOKEN", "t")]).is_err());
+        assert!(env_config(&[("COLLECTOR_API__AUTH", "nope")]).is_err());
+    }
+
+    #[test]
+    fn warns_when_open_beyond_loopback() {
+        let any: std::net::SocketAddr = "0.0.0.0:9273".parse().unwrap();
+        let lo: std::net::SocketAddr = "127.0.0.1:9273".parse().unwrap();
+        let open = env_config(&[]).unwrap();
+        assert!(open.warn_open(Some(any)));
+        assert!(!open.warn_open(Some(lo)));
+        assert!(!open.warn_open(Some("[::1]:9273".parse().unwrap())));
+        assert!(!env_config(&[("COLLECTOR_API__AUTH", "off")]).unwrap().warn_open(Some(any)));
+        assert!(!env_config(&[("COLLECTOR_API__TOKEN", "t")]).unwrap().warn_open(Some(any)));
+    }
+
+    #[test]
+    fn empty_token_file_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("collector-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("c.toml");
+        let load = |token: &str| {
+            std::fs::write(dir.join("token"), token).unwrap();
+            std::fs::write(&conf, format!("[api]\ntoken_file = {:?}\n", dir.join("token").display().to_string())).unwrap();
+            Config::load(conf.to_str())
+        };
+        assert!(load(" \n").unwrap_err().contains("empty"));
+        assert_eq!(load("secret\n").unwrap().api.token, "secret");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

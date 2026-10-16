@@ -32,8 +32,14 @@ pub fn run(cmd: &str, args: impl Iterator<Item = String>, config_path: Option<&s
             return 2;
         }
     };
-    let cfg = Config::load(config_path).ok();
-    let base = opts.url.clone().unwrap_or_else(|| default_url(cfg.as_ref().map_or("127.0.0.1:9273", |c| c.listen.as_str())));
+    let cfg = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("collector: {e}");
+            return 2;
+        }
+    };
+    let base = opts.url.clone().unwrap_or_else(|| default_url(&cfg.listen));
     let token = match &opts.token_file {
         Some(f) => match std::fs::read_to_string(f) {
             Ok(t) => t.trim().to_string(),
@@ -42,7 +48,7 @@ pub fn run(cmd: &str, args: impl Iterator<Item = String>, config_path: Option<&s
                 return 2;
             }
         },
-        None => cfg.map(|c| c.api.token).unwrap_or_default(),
+        None => cfg.api.token,
     };
     let path = match cmd {
         "health" => "/health".to_string(),
@@ -327,6 +333,12 @@ mod tests {
         assert_eq!(default_url("127.0.0.1:9300"), "http://127.0.0.1:9300");
         assert_eq!(default_url("[::]:9273"), "http://127.0.0.1:9273");
         assert_eq!(default_url("192.0.2.10:9273"), "http://192.0.2.10:9273");
+    }
+
+    #[test]
+    fn bad_config_is_reported() {
+        let missing = std::env::temp_dir().join("collector-missing.toml");
+        assert_eq!(run("health", std::iter::empty(), missing.to_str()), 2);
     }
 
     #[test]
