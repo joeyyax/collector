@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -100,17 +101,15 @@ impl Watcher {
             let started = Instant::now();
             match spawn(bin, &[format!("--query-gpu={QUERY}"), "--format=csv,noheader,nounits".into(), format!("--loop-ms={}", self.interval.as_millis())]) {
                 Ok(mut child) => {
-                    if let Some(out) = child.stdout.take() {
-                        for line in BufReader::new(out).lines().map_while(Result::ok) {
-                            for g in parse(&line) {
-                                if !seen {
-                                    seen = true;
-                                    self.start_apps(bin, per_process);
-                                }
-                                self.latest.lock().unwrap().insert(g.index, (g, Instant::now()));
+                    follow(&mut child, self.interval * 3, || true, |line| {
+                        for g in parse(line) {
+                            if !seen {
+                                seen = true;
+                                self.start_apps(bin, per_process);
                             }
+                            self.latest.lock().unwrap().insert(g.index, (g, Instant::now()));
                         }
-                    }
+                    });
                     let _ = child.wait();
                 }
                 Err(e) => {
@@ -148,13 +147,12 @@ impl Watcher {
             let started = Instant::now();
             match spawn(bin, &[format!("--query-compute-apps={APPS_QUERY}"), "--format=csv,noheader,nounits".into(), format!("--loop-ms={}", self.interval.as_millis())]) {
                 Ok(mut child) => {
-                    if let Some(out) = child.stdout.take() {
-                        for line in BufReader::new(out).lines().map_while(Result::ok) {
-                            if let Some(a) = parse_app(&line) {
-                                self.apps.lock().unwrap().feed(a, Instant::now(), gap);
-                            }
+                    // An idle GPU prints no apps, so only a stalled GPU loop marks this one hung.
+                    follow(&mut child, self.interval * 3, || self.latest().is_empty(), |line| {
+                        if let Some(a) = parse_app(line) {
+                            self.apps.lock().unwrap().feed(a, Instant::now(), gap);
                         }
-                    }
+                    });
                     let _ = child.wait();
                 }
                 Err(e) => log::warn!("gpu: {bin}: {e}"),
@@ -204,6 +202,34 @@ fn spawn(bin: &str, args: &[String]) -> std::io::Result<Child> {
         }
     }
     cmd.spawn()
+}
+
+/// Calls `f` per stdout line until the child exits, killing it when no line came for `quiet` and `stalled()` holds.
+fn follow(child: &mut Child, quiet: Duration, stalled: impl Fn() -> bool, mut f: impl FnMut(&str)) {
+    let Some(out) = child.stdout.take() else { return };
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("gpu-read".into())
+        .spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("spawn gpu-read");
+    loop {
+        match rx.recv_timeout(quiet) {
+            Ok(line) => f(&line),
+            Err(RecvTimeoutError::Timeout) if stalled() => {
+                log::warn!("gpu: nvidia-smi printed nothing for {}s; killing it", quiet.as_secs());
+                let _ = child.kill();
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 fn wait_restart(bin: &str, started: Instant, backoff: &mut Duration) {
@@ -281,6 +307,32 @@ mod tests {
         assert_eq!(apps.len(), 2);
         assert_eq!(apps[0], App { pid: 948830, uuid: "11111111-2222-3333-4444-555555555555".into(), memory_used_bytes: 1582 << 20 });
         assert_eq!(apps[1].pid, 1438842);
+    }
+
+    fn run_follow(script: &str, stalled: bool) -> (Vec<String>, std::process::ExitStatus) {
+        let (tx, rx) = mpsc::channel();
+        let script = script.to_string();
+        std::thread::spawn(move || {
+            let mut child = spawn("sh", &["-c".into(), script]).unwrap();
+            let mut lines = Vec::new();
+            follow(&mut child, Duration::from_millis(200), || stalled, |l| lines.push(l.to_string()));
+            let _ = tx.send((lines, child.wait().unwrap()));
+        });
+        rx.recv_timeout(Duration::from_secs(5)).expect("follow returned")
+    }
+
+    #[test]
+    fn kills_a_silent_child() {
+        let (lines, status) = run_follow("echo first; exec sleep 30", true);
+        assert_eq!(lines, ["first"]);
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn leaves_a_quiet_child_unless_stalled() {
+        let (lines, status) = run_follow("sleep 1; echo late", false);
+        assert_eq!(lines, ["late"]);
+        assert!(status.success());
     }
 
     #[test]

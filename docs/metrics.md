@@ -175,7 +175,7 @@ In both modes:
 
 `uuid` drops the `GPU-` prefix, as the exporter does. `nvidia_smi_gpu_info` has fewer labels than the exporter's (no driver or VBIOS version).
 
-Readings come from `nvidia-smi --query-gpu --loop-ms=<interval>`. Once it reports a GPU and container metrics are on, a second `nvidia-smi --query-compute-apps` loop reads per-process GPU memory for `container_gpu_memory_used_bytes`. Each process's container comes from `/proc/<pid>/cgroup`. With `gpu.enabled = "off"`, a build without the `gpu` feature or no `nvidia-smi`, neither runs.
+Readings come from `nvidia-smi --query-gpu --loop-ms=<interval>`. Once it reports a GPU and container metrics are on, a second `nvidia-smi --query-compute-apps` loop reads per-process GPU memory for `container_gpu_memory_used_bytes`. Each process's container comes from `/proc/<pid>/cgroup`. When the GPU loop prints nothing for three intervals, both are killed and restarted. With `gpu.enabled = "off"`, a build without the `gpu` feature or no `nvidia-smi`, neither runs.
 
 ## The collector's own
 
